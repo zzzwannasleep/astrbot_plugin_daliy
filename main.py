@@ -579,7 +579,9 @@ class DailyMorningReportPlugin(Star):
     ) -> list[dict[str, Any]]:
         nodes: list[dict[str, Any]] = []
 
-        hero_image = self._first_news_image(report_data.get("news") or [])
+        news = report_data.get("news") or []
+        lead_item = self._lead_news_item(news)
+        hero_image = lead_item.get("image", "").strip() if lead_item else self._first_news_image(news)
         if hero_image:
             nodes.append(self._telegraph_image_node(hero_image, report_data["title"]))
 
@@ -593,10 +595,15 @@ class DailyMorningReportPlugin(Star):
                 ]
             )
 
-        news = report_data.get("news") or []
         if news:
             nodes.append({"tag": "h4", "children": ["新闻速览"]})
-            nodes.extend(self._build_news_telegraph_item_nodes(news))
+            if lead_item:
+                nodes.extend(self._build_lead_telegraph_nodes(lead_item, len(news)))
+            remaining_news = news[1:] if lead_item else news
+            if remaining_news:
+                if lead_item:
+                    nodes.append({"tag": "h4", "children": ["更多要闻"]})
+                nodes.extend(self._build_news_telegraph_item_nodes(remaining_news, start_index=1 if lead_item else 0, total_count=len(news)))
 
         if report_data.get("quote"):
             nodes.extend(
@@ -624,14 +631,21 @@ class DailyMorningReportPlugin(Star):
         self, news_data: dict[str, Any]
     ) -> list[dict[str, Any]]:
         nodes: list[dict[str, Any]] = []
-        hero_image = self._first_news_image(news_data.get("news") or [])
+        news = news_data.get("news") or []
+        lead_item = self._lead_news_item(news)
+        hero_image = lead_item.get("image", "").strip() if lead_item else self._first_news_image(news)
         if hero_image:
             nodes.append(self._telegraph_image_node(hero_image, news_data["title"]))
 
         nodes.append({"tag": "p", "children": [news_data["date_line"]]})
-        news = news_data.get("news") or []
         if news:
-            nodes.extend(self._build_news_telegraph_item_nodes(news))
+            if lead_item:
+                nodes.extend(self._build_lead_telegraph_nodes(lead_item, len(news)))
+            remaining_news = news[1:] if lead_item else news
+            if remaining_news:
+                if lead_item:
+                    nodes.append({"tag": "h4", "children": ["更多要闻"]})
+                nodes.extend(self._build_news_telegraph_item_nodes(remaining_news, start_index=1 if lead_item else 0, total_count=len(news)))
         else:
             nodes.append({"tag": "p", "children": ["当前没有可用新闻，请检查 RSS 源或接口配置。"]})
 
@@ -640,14 +654,41 @@ class DailyMorningReportPlugin(Star):
             nodes.append({"tag": "p", "children": [footer]})
         return nodes
 
+    def _build_lead_telegraph_nodes(
+        self, item: dict[str, str], total_count: int
+    ) -> list[dict[str, Any]]:
+        title = item.get("title", "").strip()
+        link = item.get("link", "").strip()
+        summary = self._summary_for_rich_mode(item, 0, total_count, is_lead=True)
+        nodes: list[dict[str, Any]] = []
+
+        if title:
+            nodes.append({"tag": "h3", "children": [title]})
+        if summary:
+            nodes.append({"tag": "p", "children": [summary]})
+        if link:
+            nodes.append(
+                {
+                    "tag": "aside",
+                    "children": self._news_link_children(link),
+                }
+            )
+        nodes.append({"tag": "hr"})
+        return nodes
+
     def _build_news_telegraph_item_nodes(
-        self, news: list[dict[str, str]]
+        self,
+        news: list[dict[str, str]],
+        start_index: int = 0,
+        total_count: int | None = None,
     ) -> list[dict[str, Any]]:
         nodes: list[dict[str, Any]] = []
-        for item in news:
+        total = total_count if total_count is not None else len(news)
+        for offset, item in enumerate(news):
+            item_index = start_index + offset
             title = item.get("title", "").strip()
             link = item.get("link", "").strip()
-            summary = item.get("summary", "").strip()
+            summary = self._summary_for_rich_mode(item, item_index, total, is_lead=False)
             image = item.get("image", "").strip()
             if not title:
                 continue
@@ -660,21 +701,51 @@ class DailyMorningReportPlugin(Star):
             if link:
                 nodes.append(
                     {
-                        "tag": "p",
-                        "children": [
-                            "- ",
-                            {
-                                "tag": "a",
-                                "attrs": {"href": link},
-                                "children": ["来源"],
-                            },
-                        ],
+                        "tag": "aside",
+                        "children": self._news_link_children(link),
                     }
                 )
             else:
-                nodes.append({"tag": "p", "children": ["- 来源"]})
-            nodes.append({"tag": "hr"})
+                nodes.append({"tag": "aside", "children": ["来源"]})
+            if offset < len(news) - 1:
+                nodes.append({"tag": "hr"})
         return nodes
+
+    def _summary_for_rich_mode(
+        self, item: dict[str, str], index: int, total_count: int, is_lead: bool
+    ) -> str:
+        summary = item.get("summary", "").strip()
+        if not summary:
+            return ""
+
+        if is_lead:
+            limit = 260 if total_count <= 3 else 220 if total_count <= 5 else 180
+        else:
+            limit = 180 if total_count <= 3 else 140 if total_count <= 5 else 110
+            if index >= 3:
+                limit = min(limit, 100)
+        return self._clip_text(summary, limit)
+
+    def _news_link_children(self, link: str) -> list[Any]:
+        return [
+            "- ",
+            {
+                "tag": "a",
+                "attrs": {"href": link},
+                "children": ["来源"],
+            },
+            "  |  ",
+            {
+                "tag": "strong",
+                "children": [
+                    {
+                        "tag": "a",
+                        "attrs": {"href": link},
+                        "children": ["阅读全文"],
+                    }
+                ],
+            },
+        ]
 
     async def _enrich_news_items_for_rich_mode(
         self, client: httpx.AsyncClient, news: list[dict[str, str]]
@@ -793,6 +864,13 @@ class DailyMorningReportPlugin(Star):
             if image:
                 return image
         return ""
+
+    @staticmethod
+    def _lead_news_item(news: list[dict[str, str]]) -> dict[str, str] | None:
+        for item in news:
+            if item.get("title", "").strip():
+                return item
+        return None
 
     async def _create_telegraph_page(
         self,
