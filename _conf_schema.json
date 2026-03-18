@@ -1,0 +1,88 @@
+{
+  "enabled": {
+    "type": "bool",
+    "description": "是否启用定时晨报推送",
+    "default": true
+  },
+  "report_title": {
+    "type": "string",
+    "description": "晨报标题",
+    "default": "每日晨报"
+  },
+  "delivery_time": {
+    "type": "string",
+    "description": "每日发送时间，24 小时制",
+    "default": "08:00",
+    "hint": "格式示例: 08:00"
+  },
+  "delivery_timezone": {
+    "type": "string",
+    "description": "发送时区",
+    "default": "Asia/Shanghai",
+    "hint": "使用 IANA 时区名，例如 Asia/Shanghai、UTC"
+  },
+  "send_startup_catchup": {
+    "type": "bool",
+    "description": "AstrBot 重启后，如果已经错过今日发送时间，是否补发一次",
+    "default": false
+  },
+  "default_city": {
+    "type": "string",
+    "description": "默认天气城市",
+    "default": "北京",
+    "hint": "订阅时未单独设置城市的会话会使用这里的值"
+  },
+  "include_weather": {
+    "type": "bool",
+    "description": "是否包含天气信息",
+    "default": true
+  },
+  "include_quote": {
+    "type": "bool",
+    "description": "是否包含每日一句",
+    "default": true
+  },
+  "include_poem": {
+    "type": "bool",
+    "description": "是否包含今日诗词",
+    "default": false
+  },
+  "image_mode_enabled": {
+    "type": "bool",
+    "description": "是否启用图片模式。开启后会先将晨报文本渲染为图片再发送",
+    "default": false
+  },
+  "auto_delete_command_on_telegram": {
+    "type": "bool",
+    "description": "仅 Telegram 生效。开启后会尝试删除触发命令的那条消息，再回复晨报或状态",
+    "default": false,
+    "hint": "群组里通常需要给机器人删除消息权限"
+  },
+  "rss_urls": {
+    "type": "text",
+    "description": "RSS 源列表，每行一个 URL",
+    "default": "https://news.google.com/rss?hl=zh-CN&gl=CN&ceid=CN:zh-Hans",
+    "hint": "如果默认源不可达，请换成你自己的 RSS 源"
+  },
+  "news_limit": {
+    "type": "int",
+    "description": "晨报中展示的新闻条数",
+    "default": 5
+  },
+  "http_timeout_seconds": {
+    "type": "int",
+    "description": "外部接口请求超时时间（秒）",
+    "default": 15
+  },
+  "http_proxy": {
+    "type": "string",
+    "description": "可选 HTTP 代理地址",
+    "default": "",
+    "hint": "例如 http://127.0.0.1:7890，不填则优先使用系统环境变量代理"
+  },
+  "footer": {
+    "type": "string",
+    "description": "附加在晨报末尾的自定义文本",
+    "default": "由 AstrBot 自动推送"
+  }
+}

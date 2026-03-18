@@ -1,0 +1,9 @@
+name: astrbot_plugin_daliy
+display_name: TG 每日晨报
+desc: 为 Telegram 会话提供可订阅的每日晨报推送，包含天气、RSS 新闻和每日一句。
+version: 0.1.0
+author: OpenAI
+repo: ""
+support_platforms:
+  - telegram
+astrbot_version: ">=4.16,<5"
