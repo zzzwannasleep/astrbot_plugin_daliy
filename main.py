@@ -3,10 +3,14 @@ from __future__ import annotations
 import asyncio
 import html
 import json
+import mimetypes
+import os
 import re
+import tempfile
 from contextlib import suppress
 from datetime import datetime, timedelta
 from typing import Any
+from urllib.parse import urljoin, urlparse
 from zoneinfo import ZoneInfo
 
 import feedparser
@@ -761,21 +765,23 @@ class DailyMorningReportPlugin(Star):
         self, client: httpx.AsyncClient, item: dict[str, str]
     ):
         link = item.get("link", "").strip()
-        if not link:
-            return
-        if item.get("image") and item.get("summary"):
-            return
+        if link and (not item.get("image") or not item.get("summary")):
+            try:
+                preview = await self._fetch_article_preview(client, link)
+            except Exception as exc:
+                logger.warning("新闻详情抓取失败: link=%s error=%s", link, exc)
+            else:
+                if preview.get("image") and not item.get("image"):
+                    item["image"] = preview["image"]
+                if preview.get("summary") and not item.get("summary"):
+                    item["summary"] = preview["summary"]
 
-        try:
-            preview = await self._fetch_article_preview(client, link)
-        except Exception as exc:
-            logger.warning("新闻详情抓取失败: link=%s error=%s", link, exc)
-            return
-
-        if preview.get("image") and not item.get("image"):
-            item["image"] = preview["image"]
-        if preview.get("summary") and not item.get("summary"):
-            item["summary"] = preview["summary"]
+        if item.get("image"):
+            uploaded_image = await self._upload_image_to_telegraph_via_tempfile(client, item["image"])
+            if uploaded_image:
+                item["image"] = uploaded_image
+            else:
+                item["image"] = ""
 
     async def _fetch_article_preview(
         self, client: httpx.AsyncClient, link: str
@@ -796,9 +802,74 @@ class DailyMorningReportPlugin(Star):
         )
 
         return {
-            "image": image.strip(),
+            "image": self._absolute_url(link, image.strip()),
             "summary": self._clip_text(self._clean_text(summary), 240) if summary else "",
         }
+
+    async def _upload_image_to_telegraph_via_tempfile(
+        self, client: httpx.AsyncClient, image_url: str
+    ) -> str:
+        image_url = image_url.strip()
+        if not image_url:
+            return ""
+        if image_url.startswith("https://telegra.ph/file/"):
+            return image_url
+
+        temp_path = ""
+        try:
+            content_type = ""
+            async with client.stream("GET", image_url) as response:
+                response.raise_for_status()
+                content_type = response.headers.get("content-type", "")
+                file_suffix = self._guess_image_suffix(image_url, content_type)
+                with tempfile.NamedTemporaryFile(delete=False, suffix=file_suffix) as temp_file:
+                    temp_path = temp_file.name
+                    async for chunk in response.aiter_bytes():
+                        temp_file.write(chunk)
+
+            with open(temp_path, "rb") as image_file:
+                upload_response = await client.post(
+                    "https://telegra.ph/upload",
+                    files={
+                        "file": (
+                            os.path.basename(temp_path),
+                            image_file,
+                            content_type or "application/octet-stream",
+                        )
+                    },
+                )
+            upload_response.raise_for_status()
+            data = upload_response.json()
+            if not isinstance(data, list) or not data or "src" not in data[0]:
+                raise RuntimeError(f"Telegraph upload failed: {data}")
+            return f"https://telegra.ph{data[0]['src']}"
+        except Exception as exc:
+            logger.warning("Telegraph 图片上传失败: url=%s error=%s", image_url, exc)
+            return ""
+        finally:
+            if temp_path:
+                with suppress(Exception):
+                    os.remove(temp_path)
+
+    @staticmethod
+    def _guess_image_suffix(image_url: str, content_type: str) -> str:
+        suffix = mimetypes.guess_extension((content_type or "").split(";", 1)[0].strip())
+        if suffix:
+            return suffix
+
+        parsed = urlparse(image_url)
+        filename = os.path.basename(parsed.path)
+        _, ext = os.path.splitext(filename)
+        if ext:
+            return ext
+        return ".jpg"
+
+    @staticmethod
+    def _absolute_url(base_url: str, maybe_relative_url: str) -> str:
+        value = maybe_relative_url.strip()
+        if not value:
+            return ""
+        return urljoin(base_url, value)
 
     @staticmethod
     def _extract_meta_content(html_text: str, attr_name: str, attr_value: str) -> str:
@@ -1051,7 +1122,10 @@ class DailyMorningReportPlugin(Star):
                         "source": source,
                         "link": self._clean_text(entry.get("link", "") or ""),
                         "summary": self._extract_entry_summary(entry),
-                        "image": self._extract_entry_image(entry),
+                        "image": self._absolute_url(
+                            self._clean_text(entry.get("link", "") or ""),
+                            self._extract_entry_image(entry),
+                        ),
                     }
                 )
                 if len(items) >= news_limit:
