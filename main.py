@@ -3,70 +3,51 @@ from __future__ import annotations
 import asyncio
 import html
 import json
-import mimetypes
-import os
 import re
-import tempfile
-from contextlib import suppress
+import sys
+from collections import OrderedDict
 from datetime import datetime, timedelta
+from pathlib import Path
 from typing import Any
-from urllib.parse import quote_plus, urljoin, urlparse
 from zoneinfo import ZoneInfo
 
-import feedparser
 import httpx
 from astrbot.api import AstrBotConfig, logger
 from astrbot.api.event import AstrMessageEvent, MessageChain, filter
 from astrbot.api.star import Context, Star, register
 
+PLUGIN_DIR = Path(__file__).resolve().parent
+if str(PLUGIN_DIR) not in sys.path:
+    sys.path.insert(0, str(PLUGIN_DIR))
 
-WEEKDAY_CN = ["一", "二", "三", "四", "五", "六", "日"]
-
-WEATHER_CODE_MAP = {
-    0: "晴",
-    1: "大部晴朗",
-    2: "局部多云",
-    3: "阴",
-    45: "雾",
-    48: "冻雾",
-    51: "小毛毛雨",
-    53: "毛毛雨",
-    55: "强毛毛雨",
-    56: "冻毛毛雨",
-    57: "强冻毛毛雨",
-    61: "小雨",
-    63: "中雨",
-    65: "大雨",
-    66: "冻雨",
-    67: "强冻雨",
-    71: "小雪",
-    73: "中雪",
-    75: "大雪",
-    77: "冰粒",
-    80: "阵雨",
-    81: "强阵雨",
-    82: "暴雨阵雨",
-    85: "阵雪",
-    86: "强阵雪",
-    95: "雷暴",
-    96: "雷暴夹小冰雹",
-    99: "强雷暴夹冰雹",
-}
+from daily_shared import GEO_CACHE_MAX_SIZE, WEEKDAY_CN
+from news_mixin import NewsMixin
+from rendering_mixin import RenderingMixin
+from scheduler_mixin import SchedulerMixin
+from telegraph_mixin import TelegraphMixin
+from weather_mixin import WeatherMixin
 
 
 @register(
     "astrbot_plugin_daliy",
-    "OpenAI",
+    "zzzwannasleep",
     "Telegram 每日晨报插件",
     "0.1.0",
     "https://github.com/zzzwannasleep/astrbot_plugin_daliy",
 )
-class DailyMorningReportPlugin(Star):
+class DailyMorningReportPlugin(
+    SchedulerMixin,
+    WeatherMixin,
+    NewsMixin,
+    TelegraphMixin,
+    RenderingMixin,
+    Star,
+):
     def __init__(self, context: Context, config: AstrBotConfig):
         super().__init__(context)
         self.config = config
         self._subscriptions: dict[str, dict[str, Any]] = {}
-        self._geo_cache: dict[str, dict[str, Any]] = {}
+        self._geo_cache: OrderedDict[str, dict[str, Any]] = OrderedDict()
         self._news_cache: dict[str, Any] | None = None
         self._state_lock = asyncio.Lock()
         self._news_cache_lock = asyncio.Lock()
@@ -81,10 +62,7 @@ class DailyMorningReportPlugin(Star):
 
     async def terminate(self):
         """插件卸载或停用时清理后台任务。"""
-        if self._scheduler_task and not self._scheduler_task.done():
-            self._scheduler_task.cancel()
-            with suppress(asyncio.CancelledError):
-                await self._scheduler_task
+        await self._stop_scheduler()
 
     @filter.command_group("daily", alias={"morning", "晨报"})
     def daily(self):
@@ -280,66 +258,6 @@ class DailyMorningReportPlugin(Star):
         success_count = await self._broadcast_daily_report(reason="manual")
         yield event.plain_result(f"晨报已尝试发送，成功投递到 {success_count} 个会话。")
 
-    def _start_scheduler(self):
-        if self._scheduler_task and not self._scheduler_task.done():
-            return
-        self._scheduler_task = asyncio.create_task(self._scheduler_loop())
-
-    async def _scheduler_loop(self):
-        while True:
-            try:
-                if not self._is_enabled():
-                    await asyncio.sleep(60)
-                    continue
-
-                now = datetime.now(self._timezone())
-                next_run = self._next_run_datetime(now)
-                logger.info("晨报插件下一次发送时间: %s", next_run.isoformat())
-                await self._sleep_until(next_run)
-
-                if not self._is_enabled():
-                    continue
-
-                today_key = datetime.now(self._timezone()).date().isoformat()
-                last_delivery = await self.get_kv_data("last_delivery_date", "")
-                if last_delivery == today_key:
-                    continue
-
-                success_count = await self._broadcast_daily_report(reason="schedule")
-                if success_count > 0:
-                    await self.put_kv_data("last_delivery_date", today_key)
-            except asyncio.CancelledError:
-                raise
-            except Exception as exc:
-                logger.exception("晨报定时任务异常: %s", exc)
-                await asyncio.sleep(60)
-
-    async def _sleep_until(self, target: datetime):
-        while True:
-            now = datetime.now(target.tzinfo)
-            remaining = (target - now).total_seconds()
-            if remaining <= 0:
-                return
-            await asyncio.sleep(min(remaining, 60))
-
-    async def _maybe_send_startup_catchup(self):
-        if not self.config.get("send_startup_catchup", False):
-            return
-
-        tz = self._timezone()
-        now = datetime.now(tz)
-        scheduled = now.replace(
-            hour=self._delivery_hour(),
-            minute=self._delivery_minute(),
-            second=0,
-            microsecond=0,
-        )
-        last_delivery = await self.get_kv_data("last_delivery_date", "")
-        if now >= scheduled and last_delivery != now.date().isoformat():
-            success_count = await self._broadcast_daily_report(reason="startup-catchup")
-            if success_count > 0:
-                await self.put_kv_data("last_delivery_date", now.date().isoformat())
-
     async def _broadcast_daily_report(self, reason: str) -> int:
         subscriptions = await self._get_subscription_snapshot()
         if not subscriptions:
@@ -465,7 +383,12 @@ class DailyMorningReportPlugin(Star):
             if client:
                 await client.delete_message(chat_id=chat_id, message_id=message_id)
         except Exception as exc:
-            logger.warning("Telegram 删除命令消息失败: chat_id=%s message_id=%s error=%s", chat_id, message_id, exc)
+            logger.warning(
+                "Telegram 删除命令消息失败: chat_id=%s message_id=%s error=%s",
+                chat_id,
+                message_id,
+                exc,
+            )
 
     async def _build_report(self, city: str = "") -> str:
         async with self._http_client() as client:
@@ -523,957 +446,12 @@ class DailyMorningReportPlugin(Star):
             "news": news,
         }
 
-    def _render_report_text(self, report_data: dict[str, Any]) -> str:
-        lines = [
-            report_data["title"],
-            report_data["date_line"],
-        ]
-
-        if report_data.get("weather"):
-            lines.extend(["", "天气", report_data["weather"]])
-
-        news = report_data.get("news") or []
-        if news:
-            lines.extend(["", "新闻速览"])
-            self._append_news_lines(lines, news)
-
-        if report_data.get("quote"):
-            lines.extend(["", "今日一句", report_data["quote"]])
-
-        if report_data.get("poem"):
-            lines.extend(["", "诗词", report_data["poem"]])
-
-        footer = self._footer_text()
-        if footer:
-            lines.extend(["", footer])
-
-        if len(lines) <= 2:
-            lines.extend(["", "今天的外部数据暂时拉取失败，请检查网络、RSS 源或接口配置。"])
-
-        return "\n".join(lines)
-
-    def _render_news_text(self, news_data: dict[str, Any]) -> str:
-        lines = [
-            news_data["title"],
-            news_data["date_line"],
-        ]
-
-        news = news_data.get("news") or []
-        if news:
-            lines.append("")
-            self._append_news_lines(lines, news)
-        else:
-            lines.extend(["", "当前没有可用新闻，请检查 RSS 源或接口配置。"])
-
-        footer = self._footer_text()
-        if footer:
-            lines.extend(["", footer])
-
-        return "\n".join(lines)
-
-    def _fallback_report(self) -> str:
-        now = datetime.now(self._timezone())
-        lines = [
-            f"{self.config.get('report_title', '每日晨报')}",
-            f"{now:%Y-%m-%d} 星期{WEEKDAY_CN[now.weekday()]}",
-            "",
-            "晨报暂时生成失败，请检查网络、RSS 源或接口配置。",
-        ]
-        footer = self._footer_text()
-        if footer:
-            lines.extend(["", footer])
-        return "\n".join(lines)
-
-    def _append_news_lines(self, lines: list[str], news: list[dict[str, str]]):
-        for index, item in enumerate(news):
-            title = item.get("title", "").strip()
-            summary = self._clip_text(item.get("summary", "").strip(), 140)
-            link = item.get("link", "").strip()
-            content = summary or title
-            if not content:
-                continue
-
-            if index > 0:
-                lines.append("")
-
-            lines.append(content)
-            if link:
-                lines.append(f"- [来源]({link})")
-            else:
-                lines.append("- 来源")
-
-    def _footer_text(self) -> str:
-        bot_name = self._bot_display_name()
-        if bot_name:
-            return f"由 {bot_name} 推送"
-        return str(self.config.get("footer", "") or "").strip()
-
-    def _telegraph_page_title(self, title: str) -> str:
-        today = datetime.now(self._timezone()).strftime("%Y-%m-%d")
-        return f"{title} {today}"
-
-    def _telegraph_message(self, title: str, page_url: str) -> str:
-        return "\n".join(
-            [
-                f"{title}（图文版）",
-                page_url,
-            ]
-        )
-
-    def _build_report_telegraph_nodes(
-        self, report_data: dict[str, Any]
-    ) -> list[dict[str, Any]]:
-        nodes: list[dict[str, Any]] = []
-
-        news = report_data.get("news") or []
-        lead_item = self._lead_news_item(news)
-        hero_image = lead_item.get("image", "").strip() if lead_item else self._first_news_image(news)
-        if hero_image:
-            nodes.append(self._telegraph_image_node(hero_image, report_data["title"]))
-
-        nodes.append({"tag": "p", "children": [report_data["date_line"]]})
-
-        if report_data.get("weather"):
-            nodes.extend(
-                [
-                    {"tag": "h4", "children": ["天气"]},
-                    {"tag": "p", "children": [report_data["weather"]]},
-                ]
-            )
-
-        if news:
-            nodes.append({"tag": "h4", "children": ["新闻速览"]})
-            if lead_item:
-                nodes.extend(self._build_lead_telegraph_nodes(lead_item, len(news)))
-            remaining_news = news[1:] if lead_item else news
-            if remaining_news:
-                if lead_item:
-                    nodes.append({"tag": "h4", "children": ["更多要闻"]})
-                nodes.extend(self._build_news_telegraph_item_nodes(remaining_news, start_index=1 if lead_item else 0, total_count=len(news)))
-
-        if report_data.get("quote"):
-            nodes.extend(
-                [
-                    {"tag": "h4", "children": ["今日一句"]},
-                    {"tag": "blockquote", "children": [report_data["quote"]]},
-                ]
-            )
-
-        if report_data.get("poem"):
-            nodes.extend(
-                [
-                    {"tag": "h4", "children": ["诗词"]},
-                    {"tag": "blockquote", "children": [report_data["poem"]]},
-                ]
-            )
-
-        footer = self._footer_text()
-        if footer:
-            nodes.append({"tag": "p", "children": [footer]})
-
-        return nodes
-
-    def _build_news_telegraph_nodes(
-        self, news_data: dict[str, Any]
-    ) -> list[dict[str, Any]]:
-        nodes: list[dict[str, Any]] = []
-        news = news_data.get("news") or []
-        lead_item = self._lead_news_item(news)
-        hero_image = lead_item.get("image", "").strip() if lead_item else self._first_news_image(news)
-        if hero_image:
-            nodes.append(self._telegraph_image_node(hero_image, news_data["title"]))
-
-        nodes.append({"tag": "p", "children": [news_data["date_line"]]})
-        if news:
-            if lead_item:
-                nodes.extend(self._build_lead_telegraph_nodes(lead_item, len(news)))
-            remaining_news = news[1:] if lead_item else news
-            if remaining_news:
-                if lead_item:
-                    nodes.append({"tag": "h4", "children": ["更多要闻"]})
-                nodes.extend(self._build_news_telegraph_item_nodes(remaining_news, start_index=1 if lead_item else 0, total_count=len(news)))
-        else:
-            nodes.append({"tag": "p", "children": ["当前没有可用新闻，请检查 RSS 源或接口配置。"]})
-
-        footer = self._footer_text()
-        if footer:
-            nodes.append({"tag": "p", "children": [footer]})
-        return nodes
-
-    def _build_lead_telegraph_nodes(
-        self, item: dict[str, str], total_count: int
-    ) -> list[dict[str, Any]]:
-        title = item.get("title", "").strip()
-        link = item.get("link", "").strip()
-        summary = self._summary_for_rich_mode(item, 0, total_count, is_lead=True)
-        nodes: list[dict[str, Any]] = []
-
-        if title:
-            nodes.append({"tag": "h3", "children": [title]})
-        if summary:
-            nodes.append({"tag": "p", "children": [summary]})
-        if link:
-            nodes.append(
-                {
-                    "tag": "aside",
-                    "children": self._news_link_children(link),
-                }
-            )
-        nodes.append({"tag": "hr"})
-        return nodes
-
-    def _build_news_telegraph_item_nodes(
-        self,
-        news: list[dict[str, str]],
-        start_index: int = 0,
-        total_count: int | None = None,
-    ) -> list[dict[str, Any]]:
-        nodes: list[dict[str, Any]] = []
-        total = total_count if total_count is not None else len(news)
-        for offset, item in enumerate(news):
-            item_index = start_index + offset
-            title = item.get("title", "").strip()
-            link = item.get("link", "").strip()
-            summary = self._summary_for_rich_mode(item, item_index, total, is_lead=False)
-            image = item.get("image", "").strip()
-            if not title:
-                continue
-
-            nodes.append({"tag": "h4", "children": [title]})
-            if image:
-                nodes.append(self._telegraph_image_node(image, title))
-            if summary:
-                nodes.append({"tag": "p", "children": [summary]})
-            if link:
-                nodes.append(
-                    {
-                        "tag": "aside",
-                        "children": self._news_link_children(link),
-                    }
-                )
-            else:
-                nodes.append({"tag": "aside", "children": ["来源"]})
-            if offset < len(news) - 1:
-                nodes.append({"tag": "hr"})
-        return nodes
-
-    def _summary_for_rich_mode(
-        self, item: dict[str, str], index: int, total_count: int, is_lead: bool
-    ) -> str:
-        summary = item.get("summary", "").strip()
-        if not summary:
-            return ""
-
-        if is_lead:
-            limit = 260 if total_count <= 3 else 220 if total_count <= 5 else 180
-        else:
-            limit = 180 if total_count <= 3 else 140 if total_count <= 5 else 110
-            if index >= 3:
-                limit = min(limit, 100)
-        return self._clip_text(summary, limit)
-
-    def _news_link_children(self, link: str) -> list[Any]:
-        return [
-            "- ",
-            {
-                "tag": "a",
-                "attrs": {"href": link},
-                "children": ["来源"],
-            },
-            "  |  ",
-            {
-                "tag": "strong",
-                "children": [
-                    {
-                        "tag": "a",
-                        "attrs": {"href": link},
-                        "children": ["阅读全文"],
-                    }
-                ],
-            },
-        ]
-
-    async def _enrich_news_items_for_rich_mode(
-        self, client: httpx.AsyncClient, news: list[dict[str, str]]
-    ):
-        if not news:
-            return
-        await asyncio.gather(
-            *(self._enrich_single_news_item(client, item) for item in news),
-            return_exceptions=True,
-        )
-        await self._persist_news_cache(news)
-
-    async def _enrich_single_news_item(
-        self, client: httpx.AsyncClient, item: dict[str, str]
-    ):
-        link = item.get("link", "").strip()
-        if link and (not item.get("image") or not item.get("summary")):
-            try:
-                preview = await self._fetch_article_preview(client, link)
-            except Exception as exc:
-                logger.warning("新闻详情抓取失败: link=%s error=%s", link, exc)
-            else:
-                if preview.get("image") and not item.get("image"):
-                    item["image"] = preview["image"]
-                if preview.get("summary") and not item.get("summary"):
-                    item["summary"] = preview["summary"]
-
-        if item.get("image") and not self._is_telegraph_asset_url(item["image"]):
-            uploaded_image = await self._upload_image_to_telegraph_via_tempfile(client, item["image"])
-            if uploaded_image:
-                item["image"] = uploaded_image
-            else:
-                item["image"] = ""
-
-    async def _fetch_article_preview(
-        self, client: httpx.AsyncClient, link: str
-    ) -> dict[str, str]:
-        response = await client.get(link)
-        response.raise_for_status()
-        html_text = response.text
-
-        image = (
-            self._extract_meta_content(html_text, "property", "og:image")
-            or self._extract_meta_content(html_text, "name", "twitter:image")
-            or self._extract_first_image_from_html(html_text)
-        )
-        summary = (
-            self._extract_meta_content(html_text, "property", "og:description")
-            or self._extract_meta_content(html_text, "name", "description")
-            or self._extract_paragraph_summary_from_html(html_text)
-        )
-
-        return {
-            "image": self._absolute_url(link, image.strip()),
-            "summary": self._clip_text(self._clean_text(summary), 240) if summary else "",
-        }
-
-    async def _upload_image_to_telegraph_via_tempfile(
-        self, client: httpx.AsyncClient, image_url: str
-    ) -> str:
-        image_url = image_url.strip()
-        if not image_url:
-            return ""
-        if image_url.startswith("https://telegra.ph/file/"):
-            return image_url
-
-        temp_path = ""
-        try:
-            content_type = ""
-            async with client.stream("GET", image_url) as response:
-                response.raise_for_status()
-                content_type = response.headers.get("content-type", "")
-                file_suffix = self._guess_image_suffix(image_url, content_type)
-                with tempfile.NamedTemporaryFile(delete=False, suffix=file_suffix) as temp_file:
-                    temp_path = temp_file.name
-                    async for chunk in response.aiter_bytes():
-                        temp_file.write(chunk)
-
-            with open(temp_path, "rb") as image_file:
-                upload_response = await client.post(
-                    "https://telegra.ph/upload",
-                    files={
-                        "file": (
-                            os.path.basename(temp_path),
-                            image_file,
-                            content_type or "application/octet-stream",
-                        )
-                    },
-                )
-            upload_response.raise_for_status()
-            data = upload_response.json()
-            if not isinstance(data, list) or not data or "src" not in data[0]:
-                raise RuntimeError(f"Telegraph upload failed: {data}")
-            return f"https://telegra.ph{data[0]['src']}"
-        except Exception as exc:
-            logger.warning("Telegraph 图片上传失败: url=%s error=%s", image_url, exc)
-            return ""
-        finally:
-            if temp_path:
-                with suppress(Exception):
-                    os.remove(temp_path)
-
-    @staticmethod
-    def _guess_image_suffix(image_url: str, content_type: str) -> str:
-        suffix = mimetypes.guess_extension((content_type or "").split(";", 1)[0].strip())
-        if suffix:
-            return suffix
-
-        parsed = urlparse(image_url)
-        filename = os.path.basename(parsed.path)
-        _, ext = os.path.splitext(filename)
-        if ext:
-            return ext
-        return ".jpg"
-
-    @staticmethod
-    def _absolute_url(base_url: str, maybe_relative_url: str) -> str:
-        value = maybe_relative_url.strip()
-        if not value:
-            return ""
-        return urljoin(base_url, value)
-
-    @staticmethod
-    def _extract_meta_content(html_text: str, attr_name: str, attr_value: str) -> str:
-        pattern = (
-            rf"<meta[^>]+{attr_name}=[\"']{re.escape(attr_value)}[\"'][^>]+content=[\"']([^\"']+)[\"']"
-        )
-        match = re.search(pattern, html_text, flags=re.IGNORECASE)
-        if match:
-            return html.unescape(match.group(1))
-
-        pattern = (
-            rf"<meta[^>]+content=[\"']([^\"']+)[\"'][^>]+{attr_name}=[\"']{re.escape(attr_value)}[\"']"
-        )
-        match = re.search(pattern, html_text, flags=re.IGNORECASE)
-        if match:
-            return html.unescape(match.group(1))
-        return ""
-
-    @staticmethod
-    def _extract_first_image_from_html(html_text: str) -> str:
-        match = re.search(r"<img[^>]+src=[\"']([^\"']+)[\"']", html_text, flags=re.IGNORECASE)
-        if match:
-            return html.unescape(match.group(1))
-        return ""
-
-    def _extract_paragraph_summary_from_html(self, html_text: str) -> str:
-        paragraphs = re.findall(r"<p[^>]*>(.*?)</p>", html_text, flags=re.IGNORECASE | re.DOTALL)
-        cleaned: list[str] = []
-        for paragraph in paragraphs:
-            text = self._clean_html_text(paragraph)
-            if len(text) < 20:
-                continue
-            cleaned.append(text)
-            if len(" ".join(cleaned)) >= 220:
-                break
-        return self._clip_text(" ".join(cleaned), 240) if cleaned else ""
-
-    @staticmethod
-    def _clean_html_text(raw_html: str) -> str:
-        text = re.sub(r"<br\s*/?>", "\n", raw_html, flags=re.IGNORECASE)
-        text = re.sub(r"<[^>]+>", " ", text)
-        return " ".join(html.unescape(text).split())
-
-    @staticmethod
-    def _telegraph_image_node(image_url: str, caption: str = "") -> dict[str, Any]:
-        children: list[Any] = [
-            {
-                "tag": "img",
-                "attrs": {"src": image_url},
-            }
-        ]
-        if caption:
-            children.append({"tag": "figcaption", "children": [caption]})
-        return {
-            "tag": "figure",
-            "children": children,
-        }
-
-    @staticmethod
-    def _first_news_image(news: list[dict[str, str]]) -> str:
-        for item in news:
-            image = item.get("image", "").strip()
-            if image:
-                return image
-        return ""
-
-    @staticmethod
-    def _lead_news_item(news: list[dict[str, str]]) -> dict[str, str] | None:
-        for item in news:
-            if item.get("title", "").strip():
-                return item
-        return None
-
-    async def _create_telegraph_page(
-        self,
-        client: httpx.AsyncClient,
-        title: str,
-        content: list[dict[str, Any]],
-    ) -> str:
-        access_token = await self._get_telegraph_access_token(client)
-        response = await client.post(
-            "https://api.telegra.ph/createPage",
-            data={
-                "access_token": access_token,
-                "title": title,
-                "author_name": self._telegraph_author_name(),
-                "author_url": self._telegraph_author_url(),
-                "content": json.dumps(content, ensure_ascii=False),
-                "return_content": "false",
-            },
-        )
-        response.raise_for_status()
-        data = response.json()
-        if not data.get("ok"):
-            raise RuntimeError(data.get("error") or "Telegraph createPage failed")
-        return str(data["result"]["url"])
-
-    async def _get_telegraph_access_token(self, client: httpx.AsyncClient) -> str:
-        token = str(await self.get_kv_data("telegraph_access_token", "") or "").strip()
-        if token:
-            return token
-
-        response = await client.post(
-            "https://api.telegra.ph/createAccount",
-            data={
-                "short_name": "astrbot_daliy",
-                "author_name": self._telegraph_author_name(),
-                "author_url": self._telegraph_author_url(),
-            },
-        )
-        response.raise_for_status()
-        data = response.json()
-        if not data.get("ok"):
-            raise RuntimeError(data.get("error") or "Telegraph createAccount failed")
-
-        token = str(data["result"]["access_token"])
-        await self.put_kv_data("telegraph_access_token", token)
-        return token
-
-    def _telegraph_author_name(self) -> str:
-        return self._bot_display_name() or "AstrBot Daily"
-
-    def _telegraph_author_url(self) -> str:
-        return "https://github.com/zzzwannasleep/astrbot_plugin_daliy"
-
     def _result_or_none(self, key: str, results: dict[str, Any]) -> Any:
         value = results.get(key)
         if isinstance(value, Exception):
             logger.warning("晨报数据块拉取失败: %s error=%s", key, value)
             return None
         return value
-
-    async def _fetch_weather_summary(
-        self, client: httpx.AsyncClient, city_name: str
-    ) -> str | None:
-        provider = self._weather_provider()
-        if provider == "uapi":
-            try:
-                return await self._fetch_uapi_weather_summary(client, city_name)
-            except Exception as exc:
-                logger.warning(
-                    "UAPI 天气调用失败，已回退到 Open-Meteo: city=%s error=%s",
-                    city_name,
-                    exc,
-                )
-                return await self._fetch_open_meteo_weather_summary(client, city_name)
-        if self._weather_provider() == "custom":
-            try:
-                return await self._fetch_custom_weather_summary(client, city_name)
-            except Exception as exc:
-                logger.warning(
-                    "自定义天气 API 调用失败，已回退到 Open-Meteo: city=%s error=%s",
-                    city_name,
-                    exc,
-                )
-        return await self._fetch_open_meteo_weather_summary(client, city_name)
-
-    async def _fetch_uapi_weather_summary(
-        self, client: httpx.AsyncClient, city_name: str
-    ) -> str | None:
-        response = await client.get(
-            "https://uapis.cn/api/v1/misc/weather",
-            params={
-                "city": city_name,
-                "forecast": "true",
-                "extended": "true",
-            },
-        )
-        response.raise_for_status()
-        data = response.json()
-
-        location_name = (
-            self._clean_text(str(data.get("city", "") or ""))
-            or self._clean_text(str(data.get("province", "") or ""))
-            or city_name
-        )
-        weather_text = self._clean_text(str(data.get("weather", "") or "")) or "未知天气"
-        parts = [f"{location_name}: {weather_text}"]
-
-        temp_min = data.get("temp_min")
-        temp_max = data.get("temp_max")
-        current_temp = data.get("temperature")
-        humidity = data.get("humidity")
-        wind_direction = self._clean_text(str(data.get("wind_direction", "") or ""))
-        wind_power = self._clean_text(str(data.get("wind_power", "") or ""))
-        feels_like = data.get("feels_like")
-        aqi = data.get("aqi")
-        aqi_category = self._clean_text(str(data.get("aqi_category", "") or ""))
-
-        if temp_min is not None and temp_max is not None:
-            parts.append(f"{round(float(temp_min))}~{round(float(temp_max))}°C")
-        if current_temp is not None:
-            parts.append(f"当前 {round(float(current_temp))}°C")
-        if humidity is not None:
-            parts.append(f"湿度 {humidity}%")
-        if wind_direction or wind_power:
-            wind_text = " ".join(part for part in [wind_direction, wind_power] if part)
-            if wind_text:
-                parts.append(wind_text)
-        if feels_like is not None:
-            parts.append(f"体感 {round(float(feels_like))}°C")
-        if aqi is not None:
-            aqi_text = f"AQI {aqi}"
-            if aqi_category:
-                aqi_text = f"{aqi_text} {aqi_category}"
-            parts.append(aqi_text)
-
-        return "，".join(parts)
-
-    async def _fetch_open_meteo_weather_summary(
-        self, client: httpx.AsyncClient, city_name: str
-    ) -> str | None:
-        geo = await self._fetch_city_geo(client, city_name)
-        if not geo:
-            return f"{city_name}: 未找到该城市的天气数据。"
-
-        response = await client.get(
-            "https://api.open-meteo.com/v1/forecast",
-            params={
-                "latitude": geo["latitude"],
-                "longitude": geo["longitude"],
-                "current": "temperature_2m,weather_code",
-                "daily": (
-                    "weather_code,temperature_2m_max,temperature_2m_min,"
-                    "precipitation_probability_max,sunrise,sunset"
-                ),
-                "forecast_days": 1,
-                "timezone": self._timezone_name(),
-            },
-        )
-        response.raise_for_status()
-        data = response.json()
-
-        current = data.get("current", {})
-        daily = data.get("daily", {})
-
-        weather_code = self._first_or_default(daily.get("weather_code"), current.get("weather_code"))
-        max_temp = self._first_or_default(daily.get("temperature_2m_max"))
-        min_temp = self._first_or_default(daily.get("temperature_2m_min"))
-        rain_prob = self._first_or_default(daily.get("precipitation_probability_max"))
-        sunrise = self._format_time(self._first_or_default(daily.get("sunrise"), ""))
-        sunset = self._format_time(self._first_or_default(daily.get("sunset"), ""))
-        current_temp = current.get("temperature_2m")
-
-        location_name = geo.get("display_name") or city_name
-        weather_text = WEATHER_CODE_MAP.get(int(weather_code), "未知天气") if weather_code is not None else "未知天气"
-        parts = [f"{location_name}: {weather_text}"]
-
-        if min_temp is not None and max_temp is not None:
-            parts.append(f"{round(min_temp)}~{round(max_temp)}°C")
-        if current_temp is not None:
-            parts.append(f"当前 {round(current_temp)}°C")
-        if rain_prob is not None:
-            parts.append(f"降水概率 {rain_prob}%")
-        if sunrise:
-            parts.append(f"日出 {sunrise}")
-        if sunset:
-            parts.append(f"日落 {sunset}")
-
-        return "，".join(parts)
-
-    async def _fetch_custom_weather_summary(
-        self, client: httpx.AsyncClient, city_name: str
-    ) -> str | None:
-        template = self._custom_weather_api_url()
-        if not template:
-            raise ValueError("未配置 custom_weather_api_url")
-
-        geo: dict[str, Any] | None = None
-        if any(token in template for token in ("{latitude}", "{longitude}", "{display_name}")):
-            geo = await self._fetch_city_geo(client, city_name)
-
-        values = {
-            "city": city_name,
-            "city_urlencoded": quote_plus(city_name),
-            "timezone": self._timezone_name(),
-            "latitude": "" if not geo else str(geo.get("latitude", "")),
-            "longitude": "" if not geo else str(geo.get("longitude", "")),
-            "display_name": city_name if not geo else str(geo.get("display_name") or city_name),
-        }
-        request_url = self._fill_url_template(template, values)
-        response = await client.get(
-            request_url,
-            headers=self._custom_weather_headers(),
-        )
-        response.raise_for_status()
-
-        response_path = self._custom_weather_response_path()
-        if response_path:
-            data = response.json()
-            value = self._extract_data_by_path(data, response_path)
-            text = self._text_value(value)
-            if text:
-                return self._clip_text(text, 300)
-            raise ValueError(f"自定义天气 API 返回中未找到可用字段: {response_path}")
-
-        content_type = str(response.headers.get("content-type", "") or "").lower()
-        if "json" in content_type:
-            guessed = self._guess_weather_text_from_json(response.json())
-            if guessed:
-                return self._clip_text(guessed, 300)
-            raise ValueError("自定义天气 API 返回 JSON，但未配置 custom_weather_response_path")
-
-        text = self._clean_text(response.text)
-        return self._clip_text(text, 300) if text else None
-
-    async def _fetch_city_geo(
-        self, client: httpx.AsyncClient, city_name: str
-    ) -> dict[str, Any] | None:
-        cache_key = city_name.lower()
-        if cache_key in self._geo_cache:
-            return self._geo_cache[cache_key]
-
-        response = await client.get(
-            "https://geocoding-api.open-meteo.com/v1/search",
-            params={
-                "name": city_name,
-                "count": 1,
-                "language": "zh",
-                "format": "json",
-            },
-        )
-        response.raise_for_status()
-        data = response.json()
-        results = data.get("results") or []
-        if not results:
-            return None
-
-        item = results[0]
-        display_name = item.get("name", city_name)
-        admin1 = item.get("admin1") or ""
-        country = item.get("country") or ""
-        if admin1 and admin1 != display_name:
-            display_name = f"{display_name}, {admin1}"
-        if country:
-            display_name = f"{display_name}, {country}"
-
-        result = {
-            "latitude": item["latitude"],
-            "longitude": item["longitude"],
-            "display_name": display_name,
-        }
-        self._geo_cache[cache_key] = result
-        return result
-
-    async def _fetch_headlines(self, client: httpx.AsyncClient) -> list[dict[str, str]]:
-        cached = self._cached_news_items_from_memory()
-        if cached is not None:
-            return cached
-
-        async with self._news_cache_lock:
-            cached = self._cached_news_items_from_memory()
-            if cached is not None:
-                return cached
-
-            persisted = await self.get_kv_data("daily_news_cache", {})
-            cached = self._cached_news_items_from_entry(persisted)
-            if cached is not None:
-                self._news_cache = self._build_news_cache_entry(cached)
-                return self._clone_news_items(cached)
-
-            items = await self._fetch_headlines_uncached(client)
-            await self._set_news_cache(items)
-            return self._clone_news_items(items)
-
-    async def _fetch_headlines_uncached(
-        self, client: httpx.AsyncClient
-    ) -> list[dict[str, str]]:
-        news_limit = self._news_limit()
-        items: list[dict[str, str]] = []
-        seen_titles: set[str] = set()
-
-        for url in self._rss_urls():
-            try:
-                response = await client.get(url)
-                response.raise_for_status()
-                feed = feedparser.parse(response.text)
-                source = self._clean_text(feed.feed.get("title", "") or "")
-            except Exception as exc:
-                logger.warning("RSS 拉取失败: url=%s error=%s", url, exc)
-                continue
-
-            for entry in feed.entries:
-                title = self._clip_text(self._clean_text(entry.get("title", "") or ""), 80)
-                if not title:
-                    continue
-                key = title.casefold()
-                if key in seen_titles:
-                    continue
-                seen_titles.add(key)
-                items.append(
-                    {
-                        "title": title,
-                        "source": source,
-                        "link": self._clean_text(entry.get("link", "") or ""),
-                        "summary": self._extract_entry_summary(entry),
-                        "image": self._absolute_url(
-                            self._clean_text(entry.get("link", "") or ""),
-                            self._extract_entry_image(entry),
-                        ),
-                    }
-                )
-                if len(items) >= news_limit:
-                    return items
-
-        return items
-
-    async def _persist_news_cache(self, news: list[dict[str, str]]):
-        async with self._news_cache_lock:
-            await self._set_news_cache(news)
-
-    async def _set_news_cache(self, news: list[dict[str, str]]):
-        entry = self._build_news_cache_entry(news)
-        self._news_cache = entry
-        await self.put_kv_data("daily_news_cache", entry)
-
-    def _build_news_cache_entry(self, news: list[dict[str, str]]) -> dict[str, Any]:
-        return {
-            "date": self._news_cache_date(),
-            "signature": self._news_cache_signature(),
-            "items": self._normalize_news_items(news),
-        }
-
-    def _cached_news_items_from_memory(self) -> list[dict[str, str]] | None:
-        return self._cached_news_items_from_entry(self._news_cache)
-
-    def _cached_news_items_from_entry(self, entry: Any) -> list[dict[str, str]] | None:
-        if not isinstance(entry, dict):
-            return None
-        if entry.get("date") != self._news_cache_date():
-            return None
-        if entry.get("signature") != self._news_cache_signature():
-            return None
-        return self._normalize_news_items(entry.get("items", []))
-
-    def _normalize_news_items(self, items: Any) -> list[dict[str, str]]:
-        normalized: list[dict[str, str]] = []
-        if not isinstance(items, list):
-            return normalized
-
-        for item in items:
-            if not isinstance(item, dict):
-                continue
-            normalized_item = {
-                "title": self._clip_text(self._clean_text(str(item.get("title", "") or "")), 80),
-                "source": self._clean_text(str(item.get("source", "") or "")),
-                "link": self._clean_text(str(item.get("link", "") or "")),
-                "summary": self._clip_text(self._clean_text(str(item.get("summary", "") or "")), 240),
-                "image": self._clean_text(str(item.get("image", "") or "")),
-            }
-            if not normalized_item["title"] and not normalized_item["summary"]:
-                continue
-            normalized.append(normalized_item)
-
-        return normalized[: self._news_limit()]
-
-    @staticmethod
-    def _clone_news_items(news: list[dict[str, str]]) -> list[dict[str, str]]:
-        return [item.copy() for item in news]
-
-    def _news_cache_date(self) -> str:
-        return datetime.now(self._timezone()).date().isoformat()
-
-    def _news_cache_signature(self) -> str:
-        return json.dumps(
-            {
-                "rss_urls": self._rss_urls(),
-                "news_limit": self._news_limit(),
-            },
-            ensure_ascii=False,
-            sort_keys=True,
-            separators=(",", ":"),
-        )
-
-    def _extract_entry_summary(self, entry: Any) -> str:
-        candidates: list[str] = []
-        for key in ("summary", "description"):
-            value = entry.get(key, "")
-            if value:
-                candidates.append(str(value))
-
-        for content_item in entry.get("content", []) or []:
-            value = content_item.get("value", "")
-            if value:
-                candidates.append(str(value))
-
-        for candidate in candidates:
-            text = self._clean_html_text(candidate)
-            if text:
-                return self._clip_text(text, 240)
-        return ""
-
-    def _extract_entry_image(self, entry: Any) -> str:
-        for media_item in entry.get("media_content", []) or []:
-            url = media_item.get("url", "")
-            if url:
-                return self._clean_text(str(url))
-
-        for media_item in entry.get("media_thumbnail", []) or []:
-            url = media_item.get("url", "")
-            if url:
-                return self._clean_text(str(url))
-
-        for link_item in entry.get("links", []) or []:
-            link_type = str(link_item.get("type", "") or "")
-            href = str(link_item.get("href", "") or "")
-            if href and link_type.startswith("image/"):
-                return self._clean_text(href)
-
-        for key in ("summary", "description"):
-            value = entry.get(key, "")
-            if value:
-                image = self._extract_first_image_from_html(str(value))
-                if image:
-                    return self._clean_text(image)
-
-        for content_item in entry.get("content", []) or []:
-            value = content_item.get("value", "")
-            if value:
-                image = self._extract_first_image_from_html(str(value))
-                if image:
-                    return self._clean_text(image)
-
-        return ""
-
-    async def _fetch_hitokoto(self, client: httpx.AsyncClient) -> str | None:
-        response = await client.get(
-            "https://v1.hitokoto.cn/",
-            params={"encode": "json", "max_length": 60},
-        )
-        response.raise_for_status()
-        data = response.json()
-
-        text = self._clean_text(data.get("hitokoto", "") or "")
-        from_name = self._clean_text(
-            data.get("from_who") or data.get("from") or data.get("creator", "") or ""
-        )
-        if not text:
-            return None
-        return f"{text} —— {from_name}" if from_name else text
-
-    async def _fetch_poem(self, client: httpx.AsyncClient) -> str | None:
-        response = await client.get("https://v2.jinrishici.com/one.json")
-        response.raise_for_status()
-        data = response.json().get("data", {})
-        content = self._clean_text(data.get("content", "") or "")
-        origin = data.get("origin", {}) or {}
-        title = self._clean_text(origin.get("title", "") or "")
-        author = self._clean_text(origin.get("author", "") or "")
-
-        if not content:
-            return None
-
-        meta = "".join(
-            part
-            for part in [
-                f"《{title}》" if title else "",
-                author if author else "",
-            ]
-        )
-        return f"{content} —— {meta}" if meta else content
 
     def _http_client(self) -> httpx.AsyncClient:
         proxy = str(self.config.get("http_proxy", "") or "").strip() or None
@@ -1603,6 +581,18 @@ class DailyMorningReportPlugin(Star):
             logger.warning("无效的 delivery_time 配置: %s，已回退到 08:00", raw)
             return 8, 0
 
+    def _scheduler_config_key(self) -> str:
+        return json.dumps(
+            {
+                "enabled": self._is_enabled(),
+                "delivery_time": self._delivery_time_text(),
+                "delivery_timezone": self._timezone_name(),
+            },
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+
     def _timezone_name(self) -> str:
         value = str(self.config.get("delivery_timezone", "Asia/Shanghai") or "").strip()
         return value or "Asia/Shanghai"
@@ -1720,10 +710,32 @@ class DailyMorningReportPlugin(Star):
             return self._clean_text(str(value))
         return ""
 
-    @staticmethod
-    def _is_telegraph_asset_url(url: str) -> bool:
-        hostname = urlparse(url).hostname or ""
-        return hostname.lower() in {"telegra.ph", "graph.org"}
+    def _safe_float(self, value: Any) -> float | None:
+        if value is None or isinstance(value, bool):
+            return None
+        if isinstance(value, (int, float)):
+            return float(value)
+
+        text = self._clean_text(str(value))
+        if not text:
+            return None
+        try:
+            return float(text)
+        except (TypeError, ValueError):
+            logger.warning("天气数字字段解析失败: value=%r", value)
+            return None
+
+    def _safe_int(self, value: Any) -> int | None:
+        numeric = self._safe_float(value)
+        if numeric is None:
+            return None
+        return int(numeric)
+
+    def _remember_geo_cache(self, cache_key: str, result: dict[str, Any]):
+        self._geo_cache.pop(cache_key, None)
+        self._geo_cache[cache_key] = result.copy()
+        while len(self._geo_cache) > GEO_CACHE_MAX_SIZE:
+            self._geo_cache.popitem(last=False)
 
     @staticmethod
     def _first_or_default(value: Any, default: Any = None) -> Any:
