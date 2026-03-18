@@ -437,12 +437,7 @@ class DailyMorningReportPlugin(Star):
 
         if news:
             lines.extend(["", "新闻速览"])
-            for index, item in enumerate(news, start=1):
-                title = item.get("title", "").strip()
-                source = item.get("source", "").strip()
-                if title:
-                    suffix = f" [{source}]" if source else ""
-                    lines.append(f"{index}. {title}{suffix}")
+            self._append_news_lines(lines, news)
 
         if quote:
             lines.extend(["", "今日一句", quote])
@@ -450,7 +445,7 @@ class DailyMorningReportPlugin(Star):
         if poem:
             lines.extend(["", "诗词", poem])
 
-        footer = str(self.config.get("footer", "") or "").strip()
+        footer = self._footer_text()
         if footer:
             lines.extend(["", footer])
 
@@ -475,16 +470,11 @@ class DailyMorningReportPlugin(Star):
 
         if news:
             lines.append("")
-            for index, item in enumerate(news, start=1):
-                title = item.get("title", "").strip()
-                source = item.get("source", "").strip()
-                if title:
-                    suffix = f" [{source}]" if source else ""
-                    lines.append(f"{index}. {title}{suffix}")
+            self._append_news_lines(lines, news)
         else:
             lines.extend(["", "当前没有可用新闻，请检查 RSS 源或接口配置。"])
 
-        footer = str(self.config.get("footer", "") or "").strip()
+        footer = self._footer_text()
         if footer:
             lines.extend(["", footer])
 
@@ -498,10 +488,29 @@ class DailyMorningReportPlugin(Star):
             "",
             "晨报暂时生成失败，请检查网络、RSS 源或接口配置。",
         ]
-        footer = str(self.config.get("footer", "") or "").strip()
+        footer = self._footer_text()
         if footer:
             lines.extend(["", footer])
         return "\n".join(lines)
+
+    def _append_news_lines(self, lines: list[str], news: list[dict[str, str]]):
+        for index, item in enumerate(news, start=1):
+            title = item.get("title", "").strip()
+            source = item.get("source", "").strip()
+            link = item.get("link", "").strip()
+            if not title:
+                continue
+
+            suffix = f" [{source}]" if source else ""
+            lines.append(f"{index}. {title}{suffix}")
+            if link:
+                lines.append(link)
+
+    def _footer_text(self) -> str:
+        bot_name = str(self.config.get("bot_display_name", "") or "").strip()
+        if bot_name:
+            return f"由 {bot_name} 推送"
+        return str(self.config.get("footer", "") or "").strip()
 
     def _result_or_none(self, key: str, results: dict[str, Any]) -> Any:
         value = results.get(key)
@@ -628,6 +637,7 @@ class DailyMorningReportPlugin(Star):
                     {
                         "title": title,
                         "source": source,
+                        "link": self._clean_text(entry.get("link", "") or ""),
                     }
                 )
                 if len(items) >= news_limit:

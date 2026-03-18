@@ -32,6 +32,11 @@
     "default": "北京",
     "hint": "订阅时未单独设置城市的会话会使用这里的值"
   },
+  "bot_display_name": {
+    "type": "string",
+    "description": "Bot 展示名称。设置后页脚会显示为“由 {名称} 推送”",
+    "default": ""
+  },
   "include_weather": {
     "type": "bool",
     "description": "是否包含天气信息",
@@ -82,7 +87,7 @@
   },
   "footer": {
     "type": "string",
-    "description": "附加在晨报末尾的自定义文本",
+    "description": "附加在晨报末尾的自定义文本。未设置 bot_display_name 时生效",
     "default": "由 AstrBot 自动推送"
   }
 }

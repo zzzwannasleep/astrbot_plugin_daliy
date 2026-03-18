@@ -33,6 +33,7 @@ AstrBot/
 - `delivery_time`: 每日发送时间，默认 `08:00`
 - `delivery_timezone`: 发送时区，默认 `Asia/Shanghai`
 - `default_city`: 默认天气城市，默认 `北京`
+- `bot_display_name`: Bot 展示名称。设置后页脚会变成“由 xxx 推送”
 - `image_mode_enabled`: 是否启用图片模式，默认 `false`
 - `auto_delete_command_on_telegram`: Telegram 下是否自动删除你发出的命令消息，默认 `false`
 - `rss_urls`: RSS 源列表，每行一个 URL
@@ -77,6 +78,7 @@ AstrBot/
 - `sendnow` 需要 AstrBot 管理员权限
 - `preview` 只预览当前会话的一份晨报，不会影响订阅列表
 - `dailynews` 只拉取当前 RSS 新闻速览，不会改动订阅状态
+- 新闻项现在会带原文链接
 - 开启 `auto_delete_command_on_telegram` 后，Telegram 会先尝试删除你触发命令的那条消息，再返回结果；删除失败不会影响晨报发送
 
 ## 内容来源
