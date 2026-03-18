@@ -1048,6 +1048,17 @@ class DailyMorningReportPlugin(Star):
     async def _fetch_weather_summary(
         self, client: httpx.AsyncClient, city_name: str
     ) -> str | None:
+        provider = self._weather_provider()
+        if provider == "uapi":
+            try:
+                return await self._fetch_uapi_weather_summary(client, city_name)
+            except Exception as exc:
+                logger.warning(
+                    "UAPI 天气调用失败，已回退到 Open-Meteo: city=%s error=%s",
+                    city_name,
+                    exc,
+                )
+                return await self._fetch_open_meteo_weather_summary(client, city_name)
         if self._weather_provider() == "custom":
             try:
                 return await self._fetch_custom_weather_summary(client, city_name)
@@ -1058,6 +1069,58 @@ class DailyMorningReportPlugin(Star):
                     exc,
                 )
         return await self._fetch_open_meteo_weather_summary(client, city_name)
+
+    async def _fetch_uapi_weather_summary(
+        self, client: httpx.AsyncClient, city_name: str
+    ) -> str | None:
+        response = await client.get(
+            "https://uapis.cn/api/v1/misc/weather",
+            params={
+                "city": city_name,
+                "forecast": "true",
+                "extended": "true",
+            },
+        )
+        response.raise_for_status()
+        data = response.json()
+
+        location_name = (
+            self._clean_text(str(data.get("city", "") or ""))
+            or self._clean_text(str(data.get("province", "") or ""))
+            or city_name
+        )
+        weather_text = self._clean_text(str(data.get("weather", "") or "")) or "未知天气"
+        parts = [f"{location_name}: {weather_text}"]
+
+        temp_min = data.get("temp_min")
+        temp_max = data.get("temp_max")
+        current_temp = data.get("temperature")
+        humidity = data.get("humidity")
+        wind_direction = self._clean_text(str(data.get("wind_direction", "") or ""))
+        wind_power = self._clean_text(str(data.get("wind_power", "") or ""))
+        feels_like = data.get("feels_like")
+        aqi = data.get("aqi")
+        aqi_category = self._clean_text(str(data.get("aqi_category", "") or ""))
+
+        if temp_min is not None and temp_max is not None:
+            parts.append(f"{round(float(temp_min))}~{round(float(temp_max))}°C")
+        if current_temp is not None:
+            parts.append(f"当前 {round(float(current_temp))}°C")
+        if humidity is not None:
+            parts.append(f"湿度 {humidity}%")
+        if wind_direction or wind_power:
+            wind_text = " ".join(part for part in [wind_direction, wind_power] if part)
+            if wind_text:
+                parts.append(wind_text)
+        if feels_like is not None:
+            parts.append(f"体感 {round(float(feels_like))}°C")
+        if aqi is not None:
+            aqi_text = f"AQI {aqi}"
+            if aqi_category:
+                aqi_text = f"{aqi_text} {aqi_category}"
+            parts.append(aqi_text)
+
+        return "，".join(parts)
 
     async def _fetch_open_meteo_weather_summary(
         self, client: httpx.AsyncClient, city_name: str
@@ -1485,12 +1548,15 @@ class DailyMorningReportPlugin(Star):
         return str(self.config.get("default_city", "") or "").strip()
 
     def _weather_provider(self) -> str:
-        value = str(self.config.get("weather_provider", "open-meteo") or "").strip().lower()
-        return value if value in {"open-meteo", "custom"} else "open-meteo"
+        value = str(self.config.get("weather_provider", "uapi") or "").strip().lower()
+        return value if value in {"uapi", "open-meteo", "custom"} else "uapi"
 
     def _weather_provider_label(self) -> str:
-        if self._weather_provider() == "custom":
+        provider = self._weather_provider()
+        if provider == "custom":
             return "自定义 API"
+        if provider == "uapi":
+            return "UAPI"
         return "Open-Meteo"
 
     def _custom_weather_api_url(self) -> str:

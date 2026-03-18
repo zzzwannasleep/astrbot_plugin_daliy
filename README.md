@@ -33,7 +33,7 @@ AstrBot/
 - `delivery_time`: 每日发送时间，默认 `08:00`
 - `delivery_timezone`: 发送时区，默认 `Asia/Shanghai`
 - `default_city`: 默认天气城市，默认 `北京`
-- `weather_provider`: 天气源，默认 `open-meteo`，也支持 `custom`
+- `weather_provider`: 天气源，默认 `uapi`，也支持 `open-meteo` 和 `custom`
 - `custom_weather_api_url`: 自定义天气 API 地址模板，支持 `{city}` `{city_urlencoded}` `{latitude}` `{longitude}` `{display_name}` `{timezone}`
 - `custom_weather_response_path`: 自定义天气 API 返回 JSON 时，提取文本的字段路径
 - `custom_weather_headers`: 自定义天气 API 请求头 JSON，可放你自己的 key / token
@@ -93,7 +93,7 @@ AstrBot/
 
 自定义天气 API 用法：
 
-- 默认直接使用内置的 Open-Meteo 免费天气接口
+- 默认直接使用 UAPI 天气接口，失败时自动回退到 Open-Meteo
 - 如果你要换成自己的天气 API，把 `weather_provider` 改成 `custom`
 - `custom_weather_api_url` 可以写成类似 `https://example.com/weather?city={city_urlencoded}`
 - 如果返回是 JSON，再把 `custom_weather_response_path` 设成类似 `data.summary`
@@ -102,7 +102,7 @@ AstrBot/
 
 ## 内容来源
 
-- 天气：默认 Open-Meteo，也支持自定义天气 API
+- 天气：默认 UAPI，失败时回退到 Open-Meteo，也支持自定义天气 API
 - 每日一句：Hitokoto
 - 诗词：今日诗词（可选）
 - 新闻：用户配置的 RSS 源

@@ -34,9 +34,9 @@
   },
   "weather_provider": {
     "type": "string",
-    "description": "天气数据源。支持 open-meteo 或 custom",
-    "default": "open-meteo",
-    "hint": "默认使用内置 Open-Meteo；改成 custom 后会读取下面的自定义天气 API 配置"
+    "description": "天气数据源。支持 uapi、open-meteo 或 custom",
+    "default": "uapi",
+    "hint": "默认使用 UAPI，并在失败时自动回退到 Open-Meteo；改成 custom 后会读取下面的自定义天气 API 配置"
   },
   "custom_weather_api_url": {
     "type": "string",
