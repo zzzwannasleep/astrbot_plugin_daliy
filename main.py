@@ -67,7 +67,9 @@ class DailyMorningReportPlugin(Star):
         self.config = config
         self._subscriptions: dict[str, dict[str, Any]] = {}
         self._geo_cache: dict[str, dict[str, Any]] = {}
+        self._news_cache: dict[str, Any] | None = None
         self._state_lock = asyncio.Lock()
+        self._news_cache_lock = asyncio.Lock()
         self._scheduler_task: asyncio.Task | None = None
 
     @filter.on_astrbot_loaded()
@@ -800,6 +802,7 @@ class DailyMorningReportPlugin(Star):
             *(self._enrich_single_news_item(client, item) for item in news),
             return_exceptions=True,
         )
+        await self._persist_news_cache(news)
 
     async def _enrich_single_news_item(
         self, client: httpx.AsyncClient, item: dict[str, str]
@@ -816,7 +819,7 @@ class DailyMorningReportPlugin(Star):
                 if preview.get("summary") and not item.get("summary"):
                     item["summary"] = preview["summary"]
 
-        if item.get("image"):
+        if item.get("image") and not self._is_telegraph_asset_url(item["image"]):
             uploaded_image = await self._upload_image_to_telegraph_via_tempfile(client, item["image"])
             if uploaded_image:
                 item["image"] = uploaded_image
@@ -1193,6 +1196,28 @@ class DailyMorningReportPlugin(Star):
         return result
 
     async def _fetch_headlines(self, client: httpx.AsyncClient) -> list[dict[str, str]]:
+        cached = self._cached_news_items_from_memory()
+        if cached is not None:
+            return cached
+
+        async with self._news_cache_lock:
+            cached = self._cached_news_items_from_memory()
+            if cached is not None:
+                return cached
+
+            persisted = await self.get_kv_data("daily_news_cache", {})
+            cached = self._cached_news_items_from_entry(persisted)
+            if cached is not None:
+                self._news_cache = self._build_news_cache_entry(cached)
+                return self._clone_news_items(cached)
+
+            items = await self._fetch_headlines_uncached(client)
+            await self._set_news_cache(items)
+            return self._clone_news_items(items)
+
+    async def _fetch_headlines_uncached(
+        self, client: httpx.AsyncClient
+    ) -> list[dict[str, str]]:
         news_limit = self._news_limit()
         items: list[dict[str, str]] = []
         seen_titles: set[str] = set()
@@ -1231,6 +1256,73 @@ class DailyMorningReportPlugin(Star):
                     return items
 
         return items
+
+    async def _persist_news_cache(self, news: list[dict[str, str]]):
+        async with self._news_cache_lock:
+            await self._set_news_cache(news)
+
+    async def _set_news_cache(self, news: list[dict[str, str]]):
+        entry = self._build_news_cache_entry(news)
+        self._news_cache = entry
+        await self.put_kv_data("daily_news_cache", entry)
+
+    def _build_news_cache_entry(self, news: list[dict[str, str]]) -> dict[str, Any]:
+        return {
+            "date": self._news_cache_date(),
+            "signature": self._news_cache_signature(),
+            "items": self._normalize_news_items(news),
+        }
+
+    def _cached_news_items_from_memory(self) -> list[dict[str, str]] | None:
+        return self._cached_news_items_from_entry(self._news_cache)
+
+    def _cached_news_items_from_entry(self, entry: Any) -> list[dict[str, str]] | None:
+        if not isinstance(entry, dict):
+            return None
+        if entry.get("date") != self._news_cache_date():
+            return None
+        if entry.get("signature") != self._news_cache_signature():
+            return None
+        return self._normalize_news_items(entry.get("items", []))
+
+    def _normalize_news_items(self, items: Any) -> list[dict[str, str]]:
+        normalized: list[dict[str, str]] = []
+        if not isinstance(items, list):
+            return normalized
+
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            normalized_item = {
+                "title": self._clip_text(self._clean_text(str(item.get("title", "") or "")), 80),
+                "source": self._clean_text(str(item.get("source", "") or "")),
+                "link": self._clean_text(str(item.get("link", "") or "")),
+                "summary": self._clip_text(self._clean_text(str(item.get("summary", "") or "")), 240),
+                "image": self._clean_text(str(item.get("image", "") or "")),
+            }
+            if not normalized_item["title"] and not normalized_item["summary"]:
+                continue
+            normalized.append(normalized_item)
+
+        return normalized[: self._news_limit()]
+
+    @staticmethod
+    def _clone_news_items(news: list[dict[str, str]]) -> list[dict[str, str]]:
+        return [item.copy() for item in news]
+
+    def _news_cache_date(self) -> str:
+        return datetime.now(self._timezone()).date().isoformat()
+
+    def _news_cache_signature(self) -> str:
+        return json.dumps(
+            {
+                "rss_urls": self._rss_urls(),
+                "news_limit": self._news_limit(),
+            },
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
 
     def _extract_entry_summary(self, entry: Any) -> str:
         candidates: list[str] = []
@@ -1561,6 +1653,11 @@ class DailyMorningReportPlugin(Star):
         if isinstance(value, (str, int, float, bool)):
             return self._clean_text(str(value))
         return ""
+
+    @staticmethod
+    def _is_telegraph_asset_url(url: str) -> bool:
+        hostname = urlparse(url).hostname or ""
+        return hostname.lower() in {"telegra.ph", "graph.org"}
 
     @staticmethod
     def _first_or_default(value: Any, default: Any = None) -> Any:
