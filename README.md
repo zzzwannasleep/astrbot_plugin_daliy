@@ -47,6 +47,7 @@ AstrBot/
 - `/daily city shenzhen`
 - `/daily preview`
 - `/daily preview hangzhou`
+- `/daily news`
 - `/daily status`
 - `/daily sendnow`
 
@@ -58,6 +59,7 @@ AstrBot/
 - `/dailycity shenzhen`
 - `/dailypreview`
 - `/dailypreview hangzhou`
+- `/dailynews`
 - `/dailystatus`
 - `/dailysendnow`
 
@@ -65,6 +67,7 @@ AstrBot/
 
 - `/morning subscribe`
 - `/morning preview`
+- `/morning news`
 - `/晨报 订阅`
 - `/晨报 预览`
 
@@ -73,6 +76,7 @@ AstrBot/
 - `subscribe` 会把当前会话的 `unified_msg_origin` 记录下来，之后定时主动推送到这个会话
 - `sendnow` 需要 AstrBot 管理员权限
 - `preview` 只预览当前会话的一份晨报，不会影响订阅列表
+- `dailynews` 只拉取当前 RSS 新闻速览，不会改动订阅状态
 - 开启 `auto_delete_command_on_telegram` 后，Telegram 会先尝试删除你触发命令的那条消息，再返回结果；删除失败不会影响晨报发送
 
 ## 内容来源
@@ -89,4 +93,4 @@ AstrBot/
 
 - 这是 Telegram 定向场景插件，`metadata.yaml` 里只声明了 `telegram`
 - 默认 RSS 使用中新网滚动新闻源；如果不合适，可以在配置里替换
-- 当前输出为纯文本晨报，不做图片卡片渲染
+- 图片模式目前是文转图，不是定制海报卡片渲染

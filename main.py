@@ -171,6 +171,26 @@ class DailyMorningReportPlugin(Star):
             return
         yield event.plain_result(payload["content"])
 
+    @daily.command("news", alias={"rss", "新闻"})
+    async def news(self, event: AstrMessageEvent):
+        """查看当前 RSS 新闻速览。"""
+        async for result in self._news_impl(event):
+            yield result
+
+    @filter.command("dailynews")
+    async def daily_news(self, event: AstrMessageEvent):
+        """查看当前 RSS 新闻速览。"""
+        async for result in self._news_impl(event):
+            yield result
+
+    async def _news_impl(self, event: AstrMessageEvent):
+        await self._maybe_delete_trigger_message(event)
+        payload = await self._build_news_payload()
+        if payload["mode"] == "image":
+            yield event.image_result(payload["content"])
+            return
+        yield event.plain_result(payload["content"])
+
     @daily.command("status", alias={"info", "状态"})
     async def status(self, event: AstrMessageEvent):
         """查看当前插件配置和订阅状态。"""
@@ -321,26 +341,30 @@ class DailyMorningReportPlugin(Star):
 
     async def _build_report_payload(self, city: str = "") -> dict[str, str]:
         report = await self._build_report(city)
+        return await self._build_text_payload(report)
+
+    async def _build_news_payload(self) -> dict[str, str]:
+        news_text = await self._build_news_text()
+        return await self._build_text_payload(news_text)
+
+    async def _build_text_payload(self, text: str) -> dict[str, str]:
         if not self._image_mode_enabled():
             return {
                 "mode": "text",
-                "content": report,
-                "report": report,
+                "content": text,
             }
 
         try:
-            image_path = await self.text_to_image(report, return_url=False)
+            image_path = await self.text_to_image(text, return_url=False)
             return {
                 "mode": "image",
                 "content": image_path,
-                "report": report,
             }
         except Exception as exc:
-            logger.exception("晨报图片渲染失败，已回退为文本模式: %s", exc)
+            logger.exception("文本渲染图片失败，已回退为文本模式: %s", exc)
             return {
                 "mode": "text",
-                "content": report,
-                "report": report,
+                "content": text,
             }
 
     def _build_message_chain(self, payload: dict[str, str]) -> MessageChain:
@@ -432,6 +456,37 @@ class DailyMorningReportPlugin(Star):
 
         if len(lines) <= 2:
             lines.extend(["", "今天的外部数据暂时拉取失败，请检查网络、RSS 源或接口配置。"])
+
+        return "\n".join(lines)
+
+    async def _build_news_text(self) -> str:
+        now = datetime.now(self._timezone())
+        lines = [
+            "新闻速览",
+            f"{now:%Y-%m-%d} 星期{WEEKDAY_CN[now.weekday()]}",
+        ]
+
+        try:
+            async with self._http_client() as client:
+                news = await self._fetch_headlines(client)
+        except Exception as exc:
+            logger.exception("新闻速览拉取失败: %s", exc)
+            news = []
+
+        if news:
+            lines.append("")
+            for index, item in enumerate(news, start=1):
+                title = item.get("title", "").strip()
+                source = item.get("source", "").strip()
+                if title:
+                    suffix = f" [{source}]" if source else ""
+                    lines.append(f"{index}. {title}{suffix}")
+        else:
+            lines.extend(["", "当前没有可用新闻，请检查 RSS 源或接口配置。"])
+
+        footer = str(self.config.get("footer", "") or "").strip()
+        if footer:
+            lines.extend(["", footer])
 
         return "\n".join(lines)
 
