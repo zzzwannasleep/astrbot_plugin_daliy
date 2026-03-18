@@ -547,14 +547,16 @@ class DailyMorningReportPlugin(Star):
     def _append_news_lines(self, lines: list[str], news: list[dict[str, str]]):
         for index, item in enumerate(news):
             title = item.get("title", "").strip()
+            summary = self._clip_text(item.get("summary", "").strip(), 140)
             link = item.get("link", "").strip()
-            if not title:
+            content = summary or title
+            if not content:
                 continue
 
             if index > 0:
                 lines.append("")
 
-            lines.append(title)
+            lines.append(content)
             if link:
                 lines.append(f"- [来源]({link})")
             else:
