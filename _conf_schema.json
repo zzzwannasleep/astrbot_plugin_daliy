@@ -32,6 +32,30 @@
     "default": "北京",
     "hint": "订阅时未单独设置城市的会话会使用这里的值"
   },
+  "weather_provider": {
+    "type": "string",
+    "description": "天气数据源。支持 open-meteo 或 custom",
+    "default": "open-meteo",
+    "hint": "默认使用内置 Open-Meteo；改成 custom 后会读取下面的自定义天气 API 配置"
+  },
+  "custom_weather_api_url": {
+    "type": "string",
+    "description": "自定义天气 API 地址模板",
+    "default": "",
+    "hint": "支持占位符 {city} {city_urlencoded} {latitude} {longitude} {display_name} {timezone}"
+  },
+  "custom_weather_response_path": {
+    "type": "string",
+    "description": "自定义天气 API 的 JSON 文本字段路径",
+    "default": "",
+    "hint": "例如 data.summary 或 result.text；留空时会优先尝试直接使用响应文本"
+  },
+  "custom_weather_headers": {
+    "type": "text",
+    "description": "自定义天气 API 请求头 JSON",
+    "default": "",
+    "hint": "例如 {\"Authorization\":\"Bearer xxx\",\"X-API-Key\":\"yyy\"}"
+  },
   "bot_display_name": {
     "type": "string",
     "description": "Bot 展示名称。设置后页脚会显示为“由 {名称} 推送”",

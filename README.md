@@ -33,6 +33,10 @@ AstrBot/
 - `delivery_time`: 每日发送时间，默认 `08:00`
 - `delivery_timezone`: 发送时区，默认 `Asia/Shanghai`
 - `default_city`: 默认天气城市，默认 `北京`
+- `weather_provider`: 天气源，默认 `open-meteo`，也支持 `custom`
+- `custom_weather_api_url`: 自定义天气 API 地址模板，支持 `{city}` `{city_urlencoded}` `{latitude}` `{longitude}` `{display_name}` `{timezone}`
+- `custom_weather_response_path`: 自定义天气 API 返回 JSON 时，提取文本的字段路径
+- `custom_weather_headers`: 自定义天气 API 请求头 JSON，可放你自己的 key / token
 - `bot_display_name`: Bot 展示名称。设置后页脚会变成“由 xxx 推送”
 - `image_mode_enabled`: 是否启用 Telegraph 图文模式，默认 `false`
 - `auto_delete_command_on_telegram`: Telegram 下是否自动删除你发出的命令消息，默认 `false`
@@ -49,6 +53,7 @@ AstrBot/
 - `/daily preview`
 - `/daily preview hangzhou`
 - `/daily news`
+- `/daily weather beijing`
 - `/daily status`
 - `/daily sendnow`
 
@@ -61,6 +66,8 @@ AstrBot/
 - `/dailypreview`
 - `/dailypreview hangzhou`
 - `/dailynews`
+- `/dailyweather beijing`
+- `/weather beijing`
 - `/dailystatus`
 - `/dailysendnow`
 
@@ -78,13 +85,23 @@ AstrBot/
 - `sendnow` 需要 AstrBot 管理员权限
 - `preview` 只预览当前会话的一份晨报，不会影响订阅列表
 - `dailynews` 只拉取当前 RSS 新闻速览，不会改动订阅状态
+- `weather` / `dailyweather` 会查询指定城市天气；如果不带城市，会优先取当前会话城市，再回退到默认城市
 - 文字模式下，新闻项现在是“摘要 + 来源超链接”的形式；没有摘要时会回退到标题
 - 图文模式会尽量带上新闻配图和摘要，排版成“头条 + 更多要闻”的 Telegraph 新闻页
 - 开启 `auto_delete_command_on_telegram` 后，Telegram 会先尝试删除你触发命令的那条消息，再返回结果；删除失败不会影响晨报发送
 
+自定义天气 API 用法：
+
+- 默认直接使用内置的 Open-Meteo 免费天气接口
+- 如果你要换成自己的天气 API，把 `weather_provider` 改成 `custom`
+- `custom_weather_api_url` 可以写成类似 `https://example.com/weather?city={city_urlencoded}`
+- 如果返回是 JSON，再把 `custom_weather_response_path` 设成类似 `data.summary`
+- 如果接口需要鉴权，把 `custom_weather_headers` 设成 JSON，例如 `{"Authorization":"Bearer xxx"}`
+- 自定义天气 API 调用失败时，插件会自动回退到 Open-Meteo，避免晨报整个不可用
+
 ## 内容来源
 
-- 天气：Open-Meteo
+- 天气：默认 Open-Meteo，也支持自定义天气 API
 - 每日一句：Hitokoto
 - 诗词：今日诗词（可选）
 - 新闻：用户配置的 RSS 源

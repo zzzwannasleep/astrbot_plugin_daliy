@@ -10,7 +10,7 @@ import tempfile
 from contextlib import suppress
 from datetime import datetime, timedelta
 from typing import Any
-from urllib.parse import urljoin, urlparse
+from urllib.parse import quote_plus, urljoin, urlparse
 from zoneinfo import ZoneInfo
 
 import feedparser
@@ -180,6 +180,24 @@ class DailyMorningReportPlugin(Star):
         async for result in self._news_impl(event):
             yield result
 
+    @daily.command("weather", alias={"天气"})
+    async def weather(self, event: AstrMessageEvent, city: str = ""):
+        """查询指定城市的天气。"""
+        async for result in self._weather_impl(event, city):
+            yield result
+
+    @filter.command("weather")
+    async def quick_weather(self, event: AstrMessageEvent, city: str = ""):
+        """查询指定城市的天气。"""
+        async for result in self._weather_impl(event, city):
+            yield result
+
+    @filter.command("dailyweather")
+    async def daily_weather(self, event: AstrMessageEvent, city: str = ""):
+        """查询指定城市的天气。"""
+        async for result in self._weather_impl(event, city):
+            yield result
+
     @filter.command("dailynews")
     async def daily_news(self, event: AstrMessageEvent):
         """查看当前 RSS 新闻速览。"""
@@ -190,6 +208,25 @@ class DailyMorningReportPlugin(Star):
         await self._maybe_delete_trigger_message(event)
         payload = await self._build_news_payload()
         yield event.plain_result(payload["content"])
+
+    async def _weather_impl(self, event: AstrMessageEvent, city: str = ""):
+        await self._maybe_delete_trigger_message(event)
+        resolved_city = city.strip() or self._city_for_subscription(event.unified_msg_origin)
+        if not resolved_city:
+            yield event.plain_result("请提供城市名，或先设置默认城市 / 当前会话城市。")
+            return
+
+        try:
+            async with self._http_client() as client:
+                weather = await self._fetch_weather_summary(client, resolved_city)
+        except Exception as exc:
+            logger.warning("天气查询失败: city=%s error=%s", resolved_city, exc)
+            weather = None
+
+        if weather:
+            yield event.plain_result(weather)
+        else:
+            yield event.plain_result(f"{resolved_city}: 暂时无法获取天气信息。")
 
     @daily.command("status", alias={"info", "状态"})
     async def status(self, event: AstrMessageEvent):
@@ -213,6 +250,7 @@ class DailyMorningReportPlugin(Star):
             f"图文模式: {'开启' if self._rich_mode_enabled() else '关闭'}",
             f"TG 自动删命令: {'开启' if self._auto_delete_command_on_telegram() else '关闭'}",
             f"默认城市: {self._default_city() or '未设置'}",
+            f"天气源: {self._weather_provider_label()}",
             f"RSS 源数量: {len(self._rss_urls())}",
             f"总订阅数: {len(subscriptions)}",
             f"当前会话已订阅: {'是' if current else '否'}",
@@ -1007,6 +1045,20 @@ class DailyMorningReportPlugin(Star):
     async def _fetch_weather_summary(
         self, client: httpx.AsyncClient, city_name: str
     ) -> str | None:
+        if self._weather_provider() == "custom":
+            try:
+                return await self._fetch_custom_weather_summary(client, city_name)
+            except Exception as exc:
+                logger.warning(
+                    "自定义天气 API 调用失败，已回退到 Open-Meteo: city=%s error=%s",
+                    city_name,
+                    exc,
+                )
+        return await self._fetch_open_meteo_weather_summary(client, city_name)
+
+    async def _fetch_open_meteo_weather_summary(
+        self, client: httpx.AsyncClient, city_name: str
+    ) -> str | None:
         geo = await self._fetch_city_geo(client, city_name)
         if not geo:
             return f"{city_name}: 未找到该城市的天气数据。"
@@ -1055,6 +1107,51 @@ class DailyMorningReportPlugin(Star):
             parts.append(f"日落 {sunset}")
 
         return "，".join(parts)
+
+    async def _fetch_custom_weather_summary(
+        self, client: httpx.AsyncClient, city_name: str
+    ) -> str | None:
+        template = self._custom_weather_api_url()
+        if not template:
+            raise ValueError("未配置 custom_weather_api_url")
+
+        geo: dict[str, Any] | None = None
+        if any(token in template for token in ("{latitude}", "{longitude}", "{display_name}")):
+            geo = await self._fetch_city_geo(client, city_name)
+
+        values = {
+            "city": city_name,
+            "city_urlencoded": quote_plus(city_name),
+            "timezone": self._timezone_name(),
+            "latitude": "" if not geo else str(geo.get("latitude", "")),
+            "longitude": "" if not geo else str(geo.get("longitude", "")),
+            "display_name": city_name if not geo else str(geo.get("display_name") or city_name),
+        }
+        request_url = self._fill_url_template(template, values)
+        response = await client.get(
+            request_url,
+            headers=self._custom_weather_headers(),
+        )
+        response.raise_for_status()
+
+        response_path = self._custom_weather_response_path()
+        if response_path:
+            data = response.json()
+            value = self._extract_data_by_path(data, response_path)
+            text = self._text_value(value)
+            if text:
+                return self._clip_text(text, 300)
+            raise ValueError(f"自定义天气 API 返回中未找到可用字段: {response_path}")
+
+        content_type = str(response.headers.get("content-type", "") or "").lower()
+        if "json" in content_type:
+            guessed = self._guess_weather_text_from_json(response.json())
+            if guessed:
+                return self._clip_text(guessed, 300)
+            raise ValueError("自定义天气 API 返回 JSON，但未配置 custom_weather_response_path")
+
+        text = self._clean_text(response.text)
+        return self._clip_text(text, 300) if text else None
 
     async def _fetch_city_geo(
         self, client: httpx.AsyncClient, city_name: str
@@ -1295,6 +1392,39 @@ class DailyMorningReportPlugin(Star):
     def _default_city(self) -> str:
         return str(self.config.get("default_city", "") or "").strip()
 
+    def _weather_provider(self) -> str:
+        value = str(self.config.get("weather_provider", "open-meteo") or "").strip().lower()
+        return value if value in {"open-meteo", "custom"} else "open-meteo"
+
+    def _weather_provider_label(self) -> str:
+        if self._weather_provider() == "custom":
+            return "自定义 API"
+        return "Open-Meteo"
+
+    def _custom_weather_api_url(self) -> str:
+        return str(self.config.get("custom_weather_api_url", "") or "").strip()
+
+    def _custom_weather_response_path(self) -> str:
+        return str(self.config.get("custom_weather_response_path", "") or "").strip()
+
+    def _custom_weather_headers(self) -> dict[str, str]:
+        raw = str(self.config.get("custom_weather_headers", "") or "").strip()
+        if not raw:
+            return {}
+        try:
+            data = json.loads(raw)
+        except Exception as exc:
+            logger.warning("custom_weather_headers 解析失败: %s", exc)
+            return {}
+        if not isinstance(data, dict):
+            logger.warning("custom_weather_headers 必须是 JSON 对象。")
+            return {}
+        return {
+            str(key): str(value)
+            for key, value in data.items()
+            if key and value is not None
+        }
+
     def _delivery_time_text(self) -> str:
         return f"{self._delivery_hour():02d}:{self._delivery_minute():02d}"
 
@@ -1373,6 +1503,64 @@ class DailyMorningReportPlugin(Star):
         if len(text) <= limit:
             return text
         return f"{text[: limit - 1]}…"
+
+    def _fill_url_template(self, template: str, values: dict[str, str]) -> str:
+        return re.sub(
+            r"\{([a-zA-Z_][a-zA-Z0-9_]*)\}",
+            lambda match: values.get(match.group(1), ""),
+            template,
+        )
+
+    def _extract_data_by_path(self, data: Any, path: str) -> Any:
+        current = data
+        for segment in [part.strip() for part in path.split(".") if part.strip()]:
+            if isinstance(current, dict):
+                if segment not in current:
+                    return None
+                current = current[segment]
+                continue
+            if isinstance(current, list):
+                try:
+                    index = int(segment)
+                except ValueError:
+                    return None
+                if index < 0 or index >= len(current):
+                    return None
+                current = current[index]
+                continue
+            return None
+        return current
+
+    def _guess_weather_text_from_json(self, data: Any) -> str:
+        direct_text = self._text_value(data)
+        if direct_text:
+            return direct_text
+        for path in (
+            "weather",
+            "summary",
+            "text",
+            "result",
+            "message",
+            "data.weather",
+            "data.summary",
+            "data.text",
+            "data.result",
+            "current.weather",
+            "current.summary",
+            "current.text",
+        ):
+            value = self._extract_data_by_path(data, path)
+            text = self._text_value(value)
+            if text:
+                return text
+        return ""
+
+    def _text_value(self, value: Any) -> str:
+        if value is None:
+            return ""
+        if isinstance(value, (str, int, float, bool)):
+            return self._clean_text(str(value))
+        return ""
 
     @staticmethod
     def _first_or_default(value: Any, default: Any = None) -> Any:
