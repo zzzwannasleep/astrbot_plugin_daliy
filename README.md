@@ -34,7 +34,7 @@ AstrBot/
 - `delivery_timezone`: 发送时区，默认 `Asia/Shanghai`
 - `default_city`: 默认天气城市，默认 `北京`
 - `bot_display_name`: Bot 展示名称。设置后页脚会变成“由 xxx 推送”
-- `image_mode_enabled`: 是否启用图片模式，默认 `false`
+- `image_mode_enabled`: 是否启用 Telegraph 图文模式，默认 `false`
 - `auto_delete_command_on_telegram`: Telegram 下是否自动删除你发出的命令消息，默认 `false`
 - `rss_urls`: RSS 源列表，每行一个 URL
 - `news_limit`: 晨报中展示的新闻数量
@@ -78,7 +78,7 @@ AstrBot/
 - `sendnow` 需要 AstrBot 管理员权限
 - `preview` 只预览当前会话的一份晨报，不会影响订阅列表
 - `dailynews` 只拉取当前 RSS 新闻速览，不会改动订阅状态
-- 新闻项现在会带原文链接
+- 新闻项现在是“标题 + 来源超链接”的形式
 - 开启 `auto_delete_command_on_telegram` 后，Telegram 会先尝试删除你触发命令的那条消息，再返回结果；删除失败不会影响晨报发送
 
 ## 内容来源
@@ -89,10 +89,10 @@ AstrBot/
 - 新闻：用户配置的 RSS 源
 
 如果某个外部接口失败，插件会跳过该部分内容，不会让整条晨报直接崩掉。
-如果开启图片模式，插件会调用 AstrBot 的 `text_to_image()` 把文本晨报渲染成图片；如果渲染失败，会自动退回文本发送。
+如果开启图文模式，插件会把晨报或新闻发布到 Telegraph 页面，并把页面链接发到 Telegram；如果 Telegraph 创建失败，会自动退回文本发送。
 
 ## 已知限制
 
 - 这是 Telegram 定向场景插件，`metadata.yaml` 里只声明了 `telegram`
 - 默认 RSS 使用中新网滚动新闻源；如果不合适，可以在配置里替换
-- 图片模式目前是文转图，不是定制海报卡片渲染
+- 图文模式依赖 Telegraph 接口可访问

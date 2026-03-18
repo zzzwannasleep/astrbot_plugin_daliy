@@ -54,7 +54,7 @@
   },
   "image_mode_enabled": {
     "type": "bool",
-    "description": "是否启用图片模式。开启后会先将晨报文本渲染为图片再发送",
+    "description": "是否启用图文模式。开启后会将晨报或新闻发布到 Telegraph 页面，再发送图文链接",
     "default": false
   },
   "auto_delete_command_on_telegram": {

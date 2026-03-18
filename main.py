@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import html
+import json
 from contextlib import suppress
 from datetime import datetime, timedelta
 from typing import Any
@@ -166,9 +167,6 @@ class DailyMorningReportPlugin(Star):
         await self._maybe_delete_trigger_message(event)
         resolved_city = city.strip() or self._city_for_subscription(event.unified_msg_origin)
         payload = await self._build_report_payload(resolved_city)
-        if payload["mode"] == "image":
-            yield event.image_result(payload["content"])
-            return
         yield event.plain_result(payload["content"])
 
     @daily.command("news", alias={"rss", "新闻"})
@@ -186,9 +184,6 @@ class DailyMorningReportPlugin(Star):
     async def _news_impl(self, event: AstrMessageEvent):
         await self._maybe_delete_trigger_message(event)
         payload = await self._build_news_payload()
-        if payload["mode"] == "image":
-            yield event.image_result(payload["content"])
-            return
         yield event.plain_result(payload["content"])
 
     @daily.command("status", alias={"info", "状态"})
@@ -210,7 +205,7 @@ class DailyMorningReportPlugin(Star):
         lines = [
             f"启用状态: {'开启' if self._is_enabled() else '关闭'}",
             f"发送时间: {self._delivery_time_text()} ({self._timezone_name()})",
-            f"图片模式: {'开启' if self._image_mode_enabled() else '关闭'}",
+            f"图文模式: {'开启' if self._rich_mode_enabled() else '关闭'}",
             f"TG 自动删命令: {'开启' if self._auto_delete_command_on_telegram() else '关闭'}",
             f"默认城市: {self._default_city() or '未设置'}",
             f"RSS 源数量: {len(self._rss_urls())}",
@@ -340,38 +335,61 @@ class DailyMorningReportPlugin(Star):
         return success_count
 
     async def _build_report_payload(self, city: str = "") -> dict[str, str]:
-        report = await self._build_report(city)
-        return await self._build_text_payload(report)
+        async with self._http_client() as client:
+            report_data = await self._collect_report_data_with_client(client, city)
+            report_text = self._render_report_text(report_data)
+            if not self._rich_mode_enabled():
+                return {
+                    "mode": "text",
+                    "content": report_text,
+                }
+
+            try:
+                page_url = await self._create_telegraph_page(
+                    client,
+                    title=self._telegraph_page_title(report_data["title"]),
+                    content=self._build_report_telegraph_nodes(report_data),
+                )
+                return {
+                    "mode": "text",
+                    "content": self._telegraph_message(report_data["title"], page_url),
+                }
+            except Exception as exc:
+                logger.exception("晨报图文页生成失败，已回退为文本模式: %s", exc)
+                return {
+                    "mode": "text",
+                    "content": report_text,
+                }
 
     async def _build_news_payload(self) -> dict[str, str]:
-        news_text = await self._build_news_text()
-        return await self._build_text_payload(news_text)
+        async with self._http_client() as client:
+            news_data = await self._collect_news_data_with_client(client)
+            news_text = self._render_news_text(news_data)
+            if not self._rich_mode_enabled():
+                return {
+                    "mode": "text",
+                    "content": news_text,
+                }
 
-    async def _build_text_payload(self, text: str) -> dict[str, str]:
-        if not self._image_mode_enabled():
-            return {
-                "mode": "text",
-                "content": text,
-            }
-
-        try:
-            image_path = await self.text_to_image(text, return_url=False)
-            return {
-                "mode": "image",
-                "content": image_path,
-            }
-        except Exception as exc:
-            logger.exception("文本渲染图片失败，已回退为文本模式: %s", exc)
-            return {
-                "mode": "text",
-                "content": text,
-            }
+            try:
+                page_url = await self._create_telegraph_page(
+                    client,
+                    title=self._telegraph_page_title(news_data["title"]),
+                    content=self._build_news_telegraph_nodes(news_data),
+                )
+                return {
+                    "mode": "text",
+                    "content": self._telegraph_message(news_data["title"], page_url),
+                }
+            except Exception as exc:
+                logger.exception("新闻图文页生成失败，已回退为文本模式: %s", exc)
+                return {
+                    "mode": "text",
+                    "content": news_text,
+                }
 
     def _build_message_chain(self, payload: dict[str, str]) -> MessageChain:
-        chain = MessageChain()
-        if payload.get("mode") == "image":
-            return chain.file_image(payload["content"])
-        return chain.message(payload["content"])
+        return MessageChain().message(payload["content"])
 
     async def _maybe_delete_trigger_message(self, event: AstrMessageEvent):
         if not self._auto_delete_command_on_telegram():
@@ -403,47 +421,80 @@ class DailyMorningReportPlugin(Star):
             logger.warning("Telegram 删除命令消息失败: chat_id=%s message_id=%s error=%s", chat_id, message_id, exc)
 
     async def _build_report(self, city: str = "") -> str:
+        async with self._http_client() as client:
+            report_data = await self._collect_report_data_with_client(client, city)
+        return self._render_report_text(report_data)
+
+    async def _build_news_text(self) -> str:
+        async with self._http_client() as client:
+            news_data = await self._collect_news_data_with_client(client)
+        return self._render_news_text(news_data)
+
+    async def _collect_report_data_with_client(
+        self, client: httpx.AsyncClient, city: str = ""
+    ) -> dict[str, Any]:
         resolved_city = city.strip() or self._default_city()
         task_map: dict[str, asyncio.Task] = {}
 
-        async with self._http_client() as client:
-            if self.config.get("include_weather", True) and resolved_city:
-                task_map["weather"] = asyncio.create_task(
-                    self._fetch_weather_summary(client, resolved_city)
-                )
-            if self.config.get("include_quote", True):
-                task_map["quote"] = asyncio.create_task(self._fetch_hitokoto(client))
-            if self.config.get("include_poem", False):
-                task_map["poem"] = asyncio.create_task(self._fetch_poem(client))
-            if self._rss_urls() and self._news_limit() > 0:
-                task_map["news"] = asyncio.create_task(self._fetch_headlines(client))
+        if self.config.get("include_weather", True) and resolved_city:
+            task_map["weather"] = asyncio.create_task(
+                self._fetch_weather_summary(client, resolved_city)
+            )
+        if self.config.get("include_quote", True):
+            task_map["quote"] = asyncio.create_task(self._fetch_hitokoto(client))
+        if self.config.get("include_poem", False):
+            task_map["poem"] = asyncio.create_task(self._fetch_poem(client))
+        if self._rss_urls() and self._news_limit() > 0:
+            task_map["news"] = asyncio.create_task(self._fetch_headlines(client))
 
-            results = await asyncio.gather(*task_map.values(), return_exceptions=True)
-
+        results = await asyncio.gather(*task_map.values(), return_exceptions=True)
         sections = dict(zip(task_map.keys(), results))
         now = datetime.now(self._timezone())
+
+        return {
+            "title": str(self.config.get("report_title", "每日晨报") or "每日晨报"),
+            "date_line": f"{now:%Y-%m-%d} 星期{WEEKDAY_CN[now.weekday()]}",
+            "weather": self._result_or_none("weather", sections),
+            "news": self._result_or_none("news", sections) or [],
+            "quote": self._result_or_none("quote", sections),
+            "poem": self._result_or_none("poem", sections),
+        }
+
+    async def _collect_news_data_with_client(
+        self, client: httpx.AsyncClient
+    ) -> dict[str, Any]:
+        now = datetime.now(self._timezone())
+        try:
+            news = await self._fetch_headlines(client)
+        except Exception as exc:
+            logger.exception("新闻速览拉取失败: %s", exc)
+            news = []
+
+        return {
+            "title": "新闻速览",
+            "date_line": f"{now:%Y-%m-%d} 星期{WEEKDAY_CN[now.weekday()]}",
+            "news": news,
+        }
+
+    def _render_report_text(self, report_data: dict[str, Any]) -> str:
         lines = [
-            f"{self.config.get('report_title', '每日晨报')}",
-            f"{now:%Y-%m-%d} 星期{WEEKDAY_CN[now.weekday()]}",
+            report_data["title"],
+            report_data["date_line"],
         ]
 
-        weather = self._result_or_none("weather", sections)
-        news = self._result_or_none("news", sections)
-        quote = self._result_or_none("quote", sections)
-        poem = self._result_or_none("poem", sections)
+        if report_data.get("weather"):
+            lines.extend(["", "天气", report_data["weather"]])
 
-        if weather:
-            lines.extend(["", "天气", weather])
-
+        news = report_data.get("news") or []
         if news:
             lines.extend(["", "新闻速览"])
             self._append_news_lines(lines, news)
 
-        if quote:
-            lines.extend(["", "今日一句", quote])
+        if report_data.get("quote"):
+            lines.extend(["", "今日一句", report_data["quote"]])
 
-        if poem:
-            lines.extend(["", "诗词", poem])
+        if report_data.get("poem"):
+            lines.extend(["", "诗词", report_data["poem"]])
 
         footer = self._footer_text()
         if footer:
@@ -454,20 +505,13 @@ class DailyMorningReportPlugin(Star):
 
         return "\n".join(lines)
 
-    async def _build_news_text(self) -> str:
-        now = datetime.now(self._timezone())
+    def _render_news_text(self, news_data: dict[str, Any]) -> str:
         lines = [
-            "新闻速览",
-            f"{now:%Y-%m-%d} 星期{WEEKDAY_CN[now.weekday()]}",
+            news_data["title"],
+            news_data["date_line"],
         ]
 
-        try:
-            async with self._http_client() as client:
-                news = await self._fetch_headlines(client)
-        except Exception as exc:
-            logger.exception("新闻速览拉取失败: %s", exc)
-            news = []
-
+        news = news_data.get("news") or []
         if news:
             lines.append("")
             self._append_news_lines(lines, news)
@@ -494,23 +538,178 @@ class DailyMorningReportPlugin(Star):
         return "\n".join(lines)
 
     def _append_news_lines(self, lines: list[str], news: list[dict[str, str]]):
-        for index, item in enumerate(news, start=1):
+        for index, item in enumerate(news):
             title = item.get("title", "").strip()
-            source = item.get("source", "").strip()
             link = item.get("link", "").strip()
             if not title:
                 continue
 
-            suffix = f" [{source}]" if source else ""
-            lines.append(f"{index}. {title}{suffix}")
+            if index > 0:
+                lines.append("")
+
+            lines.append(title)
             if link:
-                lines.append(link)
+                lines.append(f"- [来源]({link})")
+            else:
+                lines.append("- 来源")
 
     def _footer_text(self) -> str:
-        bot_name = str(self.config.get("bot_display_name", "") or "").strip()
+        bot_name = self._bot_display_name()
         if bot_name:
             return f"由 {bot_name} 推送"
         return str(self.config.get("footer", "") or "").strip()
+
+    def _telegraph_page_title(self, title: str) -> str:
+        today = datetime.now(self._timezone()).strftime("%Y-%m-%d")
+        return f"{title} {today}"
+
+    def _telegraph_message(self, title: str, page_url: str) -> str:
+        return "\n".join(
+            [
+                f"{title}（图文版）",
+                page_url,
+            ]
+        )
+
+    def _build_report_telegraph_nodes(
+        self, report_data: dict[str, Any]
+    ) -> list[dict[str, Any]]:
+        nodes: list[dict[str, Any]] = [
+            {"tag": "p", "children": [report_data["date_line"]]},
+        ]
+
+        if report_data.get("weather"):
+            nodes.extend(
+                [
+                    {"tag": "h4", "children": ["天气"]},
+                    {"tag": "p", "children": [report_data["weather"]]},
+                ]
+            )
+
+        news = report_data.get("news") or []
+        if news:
+            nodes.append({"tag": "h4", "children": ["新闻速览"]})
+            nodes.extend(self._build_news_telegraph_item_nodes(news))
+
+        if report_data.get("quote"):
+            nodes.extend(
+                [
+                    {"tag": "h4", "children": ["今日一句"]},
+                    {"tag": "blockquote", "children": [report_data["quote"]]},
+                ]
+            )
+
+        if report_data.get("poem"):
+            nodes.extend(
+                [
+                    {"tag": "h4", "children": ["诗词"]},
+                    {"tag": "blockquote", "children": [report_data["poem"]]},
+                ]
+            )
+
+        footer = self._footer_text()
+        if footer:
+            nodes.append({"tag": "p", "children": [footer]})
+
+        return nodes
+
+    def _build_news_telegraph_nodes(
+        self, news_data: dict[str, Any]
+    ) -> list[dict[str, Any]]:
+        nodes: list[dict[str, Any]] = [
+            {"tag": "p", "children": [news_data["date_line"]]},
+        ]
+        news = news_data.get("news") or []
+        if news:
+            nodes.extend(self._build_news_telegraph_item_nodes(news))
+        else:
+            nodes.append({"tag": "p", "children": ["当前没有可用新闻，请检查 RSS 源或接口配置。"]})
+
+        footer = self._footer_text()
+        if footer:
+            nodes.append({"tag": "p", "children": [footer]})
+        return nodes
+
+    def _build_news_telegraph_item_nodes(
+        self, news: list[dict[str, str]]
+    ) -> list[dict[str, Any]]:
+        nodes: list[dict[str, Any]] = []
+        for item in news:
+            title = item.get("title", "").strip()
+            link = item.get("link", "").strip()
+            if not title:
+                continue
+
+            nodes.append({"tag": "p", "children": [title]})
+            if link:
+                nodes.append(
+                    {
+                        "tag": "p",
+                        "children": [
+                            "- ",
+                            {
+                                "tag": "a",
+                                "attrs": {"href": link},
+                                "children": ["来源"],
+                            },
+                        ],
+                    }
+                )
+            else:
+                nodes.append({"tag": "p", "children": ["- 来源"]})
+        return nodes
+
+    async def _create_telegraph_page(
+        self,
+        client: httpx.AsyncClient,
+        title: str,
+        content: list[dict[str, Any]],
+    ) -> str:
+        access_token = await self._get_telegraph_access_token(client)
+        response = await client.post(
+            "https://api.telegra.ph/createPage",
+            data={
+                "access_token": access_token,
+                "title": title,
+                "author_name": self._telegraph_author_name(),
+                "author_url": self._telegraph_author_url(),
+                "content": json.dumps(content, ensure_ascii=False),
+                "return_content": "false",
+            },
+        )
+        response.raise_for_status()
+        data = response.json()
+        if not data.get("ok"):
+            raise RuntimeError(data.get("error") or "Telegraph createPage failed")
+        return str(data["result"]["url"])
+
+    async def _get_telegraph_access_token(self, client: httpx.AsyncClient) -> str:
+        token = str(await self.get_kv_data("telegraph_access_token", "") or "").strip()
+        if token:
+            return token
+
+        response = await client.post(
+            "https://api.telegra.ph/createAccount",
+            data={
+                "short_name": "astrbot_daliy",
+                "author_name": self._telegraph_author_name(),
+                "author_url": self._telegraph_author_url(),
+            },
+        )
+        response.raise_for_status()
+        data = response.json()
+        if not data.get("ok"):
+            raise RuntimeError(data.get("error") or "Telegraph createAccount failed")
+
+        token = str(data["result"]["access_token"])
+        await self.put_kv_data("telegraph_access_token", token)
+        return token
+
+    def _telegraph_author_name(self) -> str:
+        return self._bot_display_name() or "AstrBot Daily"
+
+    def _telegraph_author_url(self) -> str:
+        return "https://github.com/zzzwannasleep/astrbot_plugin_daliy"
 
     def _result_or_none(self, key: str, results: dict[str, Any]) -> Any:
         value = results.get(key)
@@ -814,8 +1013,11 @@ class DailyMorningReportPlugin(Star):
     def _is_enabled(self) -> bool:
         return bool(self.config.get("enabled", True))
 
-    def _image_mode_enabled(self) -> bool:
+    def _rich_mode_enabled(self) -> bool:
         return bool(self.config.get("image_mode_enabled", False))
+
+    def _bot_display_name(self) -> str:
+        return str(self.config.get("bot_display_name", "") or "").strip()
 
     def _auto_delete_command_on_telegram(self) -> bool:
         return bool(self.config.get("auto_delete_command_on_telegram", False))
