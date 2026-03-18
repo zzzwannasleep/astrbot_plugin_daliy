@@ -53,7 +53,7 @@ WEATHER_CODE_MAP = {
     "OpenAI",
     "Telegram 每日晨报插件",
     "0.1.0",
-    "",
+    "https://github.com/zzzwannasleep/astrbot_plugin_daliy",
 )
 class DailyMorningReportPlugin(Star):
     def __init__(self, context: Context, config: AstrBotConfig):
