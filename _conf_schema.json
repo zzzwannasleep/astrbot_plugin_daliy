@@ -61,8 +61,8 @@
   "rss_urls": {
     "type": "text",
     "description": "RSS 源列表，每行一个 URL",
-    "default": "https://news.google.com/rss?hl=zh-CN&gl=CN&ceid=CN:zh-Hans",
-    "hint": "如果默认源不可达，请换成你自己的 RSS 源"
+    "default": "https://www.chinanews.com.cn/rss/scroll-news.xml",
+    "hint": "默认使用中新网滚动新闻源；如果不合适，可替换成你自己的 RSS 源"
   },
   "news_limit": {
     "type": "int",
