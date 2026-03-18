@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import html
 import json
+import re
 from contextlib import suppress
 from datetime import datetime, timedelta
 from typing import Any
@@ -345,6 +346,7 @@ class DailyMorningReportPlugin(Star):
                 }
 
             try:
+                await self._enrich_news_items_for_rich_mode(client, report_data["news"])
                 page_url = await self._create_telegraph_page(
                     client,
                     title=self._telegraph_page_title(report_data["title"]),
@@ -372,6 +374,7 @@ class DailyMorningReportPlugin(Star):
                 }
 
             try:
+                await self._enrich_news_items_for_rich_mode(client, news_data["news"])
                 page_url = await self._create_telegraph_page(
                     client,
                     title=self._telegraph_page_title(news_data["title"]),
@@ -574,9 +577,13 @@ class DailyMorningReportPlugin(Star):
     def _build_report_telegraph_nodes(
         self, report_data: dict[str, Any]
     ) -> list[dict[str, Any]]:
-        nodes: list[dict[str, Any]] = [
-            {"tag": "p", "children": [report_data["date_line"]]},
-        ]
+        nodes: list[dict[str, Any]] = []
+
+        hero_image = self._first_news_image(report_data.get("news") or [])
+        if hero_image:
+            nodes.append(self._telegraph_image_node(hero_image, report_data["title"]))
+
+        nodes.append({"tag": "p", "children": [report_data["date_line"]]})
 
         if report_data.get("weather"):
             nodes.extend(
@@ -616,9 +623,12 @@ class DailyMorningReportPlugin(Star):
     def _build_news_telegraph_nodes(
         self, news_data: dict[str, Any]
     ) -> list[dict[str, Any]]:
-        nodes: list[dict[str, Any]] = [
-            {"tag": "p", "children": [news_data["date_line"]]},
-        ]
+        nodes: list[dict[str, Any]] = []
+        hero_image = self._first_news_image(news_data.get("news") or [])
+        if hero_image:
+            nodes.append(self._telegraph_image_node(hero_image, news_data["title"]))
+
+        nodes.append({"tag": "p", "children": [news_data["date_line"]]})
         news = news_data.get("news") or []
         if news:
             nodes.extend(self._build_news_telegraph_item_nodes(news))
@@ -637,10 +647,16 @@ class DailyMorningReportPlugin(Star):
         for item in news:
             title = item.get("title", "").strip()
             link = item.get("link", "").strip()
+            summary = item.get("summary", "").strip()
+            image = item.get("image", "").strip()
             if not title:
                 continue
 
-            nodes.append({"tag": "p", "children": [title]})
+            nodes.append({"tag": "h4", "children": [title]})
+            if image:
+                nodes.append(self._telegraph_image_node(image, title))
+            if summary:
+                nodes.append({"tag": "p", "children": [summary]})
             if link:
                 nodes.append(
                     {
@@ -657,7 +673,126 @@ class DailyMorningReportPlugin(Star):
                 )
             else:
                 nodes.append({"tag": "p", "children": ["- 来源"]})
+            nodes.append({"tag": "hr"})
         return nodes
+
+    async def _enrich_news_items_for_rich_mode(
+        self, client: httpx.AsyncClient, news: list[dict[str, str]]
+    ):
+        if not news:
+            return
+        await asyncio.gather(
+            *(self._enrich_single_news_item(client, item) for item in news),
+            return_exceptions=True,
+        )
+
+    async def _enrich_single_news_item(
+        self, client: httpx.AsyncClient, item: dict[str, str]
+    ):
+        link = item.get("link", "").strip()
+        if not link:
+            return
+        if item.get("image") and item.get("summary"):
+            return
+
+        try:
+            preview = await self._fetch_article_preview(client, link)
+        except Exception as exc:
+            logger.warning("新闻详情抓取失败: link=%s error=%s", link, exc)
+            return
+
+        if preview.get("image") and not item.get("image"):
+            item["image"] = preview["image"]
+        if preview.get("summary") and not item.get("summary"):
+            item["summary"] = preview["summary"]
+
+    async def _fetch_article_preview(
+        self, client: httpx.AsyncClient, link: str
+    ) -> dict[str, str]:
+        response = await client.get(link)
+        response.raise_for_status()
+        html_text = response.text
+
+        image = (
+            self._extract_meta_content(html_text, "property", "og:image")
+            or self._extract_meta_content(html_text, "name", "twitter:image")
+            or self._extract_first_image_from_html(html_text)
+        )
+        summary = (
+            self._extract_meta_content(html_text, "property", "og:description")
+            or self._extract_meta_content(html_text, "name", "description")
+            or self._extract_paragraph_summary_from_html(html_text)
+        )
+
+        return {
+            "image": image.strip(),
+            "summary": self._clip_text(self._clean_text(summary), 240) if summary else "",
+        }
+
+    @staticmethod
+    def _extract_meta_content(html_text: str, attr_name: str, attr_value: str) -> str:
+        pattern = (
+            rf"<meta[^>]+{attr_name}=[\"']{re.escape(attr_value)}[\"'][^>]+content=[\"']([^\"']+)[\"']"
+        )
+        match = re.search(pattern, html_text, flags=re.IGNORECASE)
+        if match:
+            return html.unescape(match.group(1))
+
+        pattern = (
+            rf"<meta[^>]+content=[\"']([^\"']+)[\"'][^>]+{attr_name}=[\"']{re.escape(attr_value)}[\"']"
+        )
+        match = re.search(pattern, html_text, flags=re.IGNORECASE)
+        if match:
+            return html.unescape(match.group(1))
+        return ""
+
+    @staticmethod
+    def _extract_first_image_from_html(html_text: str) -> str:
+        match = re.search(r"<img[^>]+src=[\"']([^\"']+)[\"']", html_text, flags=re.IGNORECASE)
+        if match:
+            return html.unescape(match.group(1))
+        return ""
+
+    def _extract_paragraph_summary_from_html(self, html_text: str) -> str:
+        paragraphs = re.findall(r"<p[^>]*>(.*?)</p>", html_text, flags=re.IGNORECASE | re.DOTALL)
+        cleaned: list[str] = []
+        for paragraph in paragraphs:
+            text = self._clean_html_text(paragraph)
+            if len(text) < 20:
+                continue
+            cleaned.append(text)
+            if len(" ".join(cleaned)) >= 220:
+                break
+        return self._clip_text(" ".join(cleaned), 240) if cleaned else ""
+
+    @staticmethod
+    def _clean_html_text(raw_html: str) -> str:
+        text = re.sub(r"<br\s*/?>", "\n", raw_html, flags=re.IGNORECASE)
+        text = re.sub(r"<[^>]+>", " ", text)
+        return " ".join(html.unescape(text).split())
+
+    @staticmethod
+    def _telegraph_image_node(image_url: str, caption: str = "") -> dict[str, Any]:
+        children: list[Any] = [
+            {
+                "tag": "img",
+                "attrs": {"src": image_url},
+            }
+        ]
+        if caption:
+            children.append({"tag": "figcaption", "children": [caption]})
+        return {
+            "tag": "figure",
+            "children": children,
+        }
+
+    @staticmethod
+    def _first_news_image(news: list[dict[str, str]]) -> str:
+        for item in news:
+            image = item.get("image", "").strip()
+            if image:
+                return image
+        return ""
 
     async def _create_telegraph_page(
         self,
@@ -837,12 +972,65 @@ class DailyMorningReportPlugin(Star):
                         "title": title,
                         "source": source,
                         "link": self._clean_text(entry.get("link", "") or ""),
+                        "summary": self._extract_entry_summary(entry),
+                        "image": self._extract_entry_image(entry),
                     }
                 )
                 if len(items) >= news_limit:
                     return items
 
         return items
+
+    def _extract_entry_summary(self, entry: Any) -> str:
+        candidates: list[str] = []
+        for key in ("summary", "description"):
+            value = entry.get(key, "")
+            if value:
+                candidates.append(str(value))
+
+        for content_item in entry.get("content", []) or []:
+            value = content_item.get("value", "")
+            if value:
+                candidates.append(str(value))
+
+        for candidate in candidates:
+            text = self._clean_html_text(candidate)
+            if text:
+                return self._clip_text(text, 240)
+        return ""
+
+    def _extract_entry_image(self, entry: Any) -> str:
+        for media_item in entry.get("media_content", []) or []:
+            url = media_item.get("url", "")
+            if url:
+                return self._clean_text(str(url))
+
+        for media_item in entry.get("media_thumbnail", []) or []:
+            url = media_item.get("url", "")
+            if url:
+                return self._clean_text(str(url))
+
+        for link_item in entry.get("links", []) or []:
+            link_type = str(link_item.get("type", "") or "")
+            href = str(link_item.get("href", "") or "")
+            if href and link_type.startswith("image/"):
+                return self._clean_text(href)
+
+        for key in ("summary", "description"):
+            value = entry.get(key, "")
+            if value:
+                image = self._extract_first_image_from_html(str(value))
+                if image:
+                    return self._clean_text(image)
+
+        for content_item in entry.get("content", []) or []:
+            value = content_item.get("value", "")
+            if value:
+                image = self._extract_first_image_from_html(str(value))
+                if image:
+                    return self._clean_text(image)
+
+        return ""
 
     async def _fetch_hitokoto(self, client: httpx.AsyncClient) -> str | None:
         response = await client.get(
